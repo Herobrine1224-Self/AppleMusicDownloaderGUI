@@ -1,0 +1,5 @@
+/.gocache/
+/.gomodcache/
+/dist/
+*.syso
+

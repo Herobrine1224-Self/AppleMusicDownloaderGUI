@@ -1,0 +1,26 @@
+# Build outputs and packaged releases
+**/dist/
+**/cmake-build-*/
+*.exe
+*.zip
+*.syso
+
+# Go build caches
+**/.gocache/
+**/.gocache-review/
+**/.gomodcache/
+
+# Local tooling and IDE state
+**/.debug/
+**/.idea/
+*.user
+*.suo
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# OS metadata
+Thumbs.db
+.DS_Store
