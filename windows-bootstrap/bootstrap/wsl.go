@@ -101,6 +101,14 @@ func (w WSLClient) HasPendingLogin(ctx context.Context, state State) (bool, erro
 	return strings.TrimSpace(DecodeWindowsOutput(result.Stdout)) == "pending", nil
 }
 
+// ClearLoginData 删除 wrapper 保存的 Apple Music 登录数据（token、storefront、
+// 曲库数据库和验证码），使下一次 start 返回 login_required。
+func (w WSLClient) ClearLoginData(ctx context.Context, state State) error {
+	script := `rm -rf -- "$1/STOREFRONT_ID" "$1/MUSIC_TOKEN" "$1/mpl_db" "$1/2fa.txt"`
+	_, err := w.Exec(ctx, state.DistroName, "root", "/bin/sh", "-c", script, "applemusic-logout", LoginDataLinuxDir)
+	return err
+}
+
 func (w WSLClient) WritePrivateFile(ctx context.Context, state State, linuxPath string, data []byte) error {
 	script := `umask 077; tmp="$1.tmp.$$"; trap 'rm -f "$tmp"' EXIT HUP INT TERM; cat >"$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$1"`
 	_, err := w.ExecInput(ctx, state.DistroName, "root", data, "/bin/sh", "-c", script, "applemusic-private-write", linuxPath)

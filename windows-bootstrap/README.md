@@ -78,6 +78,12 @@ dist\AppleMusicWSL\
 .\AppleMusicWSL.exe submit-code
 ```
 
+清除 Apple Music 登录状态（下次 start 会要求重新登录）：
+
+```powershell
+.\AppleMusicWSL.exe logout
+```
+
 登录成功后启动 wrapper：
 
 ```powershell

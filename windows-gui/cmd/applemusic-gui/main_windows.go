@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/lxn/walk"
@@ -124,6 +125,7 @@ type gui struct {
 	envRecovery  *walk.Label
 	stopButton   *walk.PushButton
 	removeButton *walk.PushButton
+	logoutButton *walk.PushButton
 
 	lastStatus        app.BootstrapStatus
 	busy              bool
@@ -138,6 +140,8 @@ type gui struct {
 	shutdownPending   bool
 	closeAllowed      bool
 	runtimeStopped    bool
+	detachedStop      bool
+	downloadComplete  bool
 }
 
 type downloadRequest struct {
@@ -481,9 +485,9 @@ func (g *gui) loginPage() Widget {
 		Children: []Widget{
 			Label{Text: "登录 Apple Music", TextColor: colorText, Font: Font{Family: "Segoe UI", PointSize: 18, Bold: true}, MinSize: Size{Height: 32}},
 			Label{Text: "Apple ID", TextColor: colorText, MinSize: Size{Height: 22}},
-			LineEdit{AssignTo: &g.loginAppleID, CueBanner: "name@example.com", MaxLength: 254, MinSize: Size{Height: 34}},
+			LineEdit{AssignTo: &g.loginAppleID, CueBanner: "name@example.com", MaxLength: 254, Font: Font{Family: "Segoe UI", PointSize: 12}, MinSize: Size{Height: 34}},
 			Label{Text: "密码", TextColor: colorText, MinSize: Size{Height: 22}},
-			LineEdit{AssignTo: &g.loginPassword, PasswordMode: true, MaxLength: 512, MinSize: Size{Height: 34}},
+			LineEdit{AssignTo: &g.loginPassword, PasswordMode: true, MaxLength: 512, Font: Font{Family: "Segoe UI", PointSize: 12}, MinSize: Size{Height: 34}},
 			Label{AssignTo: &g.loginError, Text: "", TextColor: colorAccent, MinSize: Size{Height: 24}},
 			Composite{Layout: HBox{MarginsZero: true}, Children: []Widget{
 				PushButton{AssignTo: &g.loginButton, Text: "登录", MinSize: Size{Width: 112, Height: 36}, OnClicked: g.startLogin},
@@ -508,7 +512,7 @@ func (g *gui) twoFactorPage() Widget {
 			VSpacer{},
 			Label{Text: "输入验证码", TextColor: colorText, Font: Font{Family: "Segoe UI", PointSize: 18, Bold: true}, MinSize: Size{Height: 32}},
 			Label{Text: "请输入受信任设备上显示的六位数字。", TextColor: colorMuted, MinSize: Size{Height: 24}},
-			LineEdit{AssignTo: &g.codeEdit, CueBanner: "000000", MaxLength: 6, MinSize: Size{Width: 220, Height: 36}, MaxSize: Size{Width: 220}},
+			LineEdit{AssignTo: &g.codeEdit, CueBanner: "000000", MaxLength: 6, Font: Font{Family: "Segoe UI", PointSize: 12}, MinSize: Size{Width: 220, Height: 36}, MaxSize: Size{Width: 220}},
 			Label{AssignTo: &g.codeError, Text: "", TextColor: colorAccent, MinSize: Size{Height: 24}},
 			Composite{Layout: HBox{MarginsZero: true}, Children: []Widget{
 				PushButton{AssignTo: &g.codeButton, Text: "验证", MinSize: Size{Width: 112, Height: 36}, OnClicked: g.startTwoFactor},
@@ -655,6 +659,7 @@ func (g *gui) environmentTab() []Widget {
 		VSpacer{},
 		Label{Text: "移除前会将专用发行版完整导出到“文档\\AppleMusicDownloader Backups”。", TextColor: colorMuted, MinSize: Size{Height: 24}},
 		Composite{Layout: HBox{MarginsZero: true}, Children: []Widget{
+			PushButton{AssignTo: &g.logoutButton, Text: "退出 Apple ID", MinSize: Size{Width: 112, Height: 34}, OnClicked: g.startLogout},
 			PushButton{AssignTo: &g.removeButton, Text: "备份并移除环境...", MinSize: Size{Width: 152, Height: 34}, OnClicked: g.removeRuntime},
 			HSpacer{},
 		}},
@@ -717,6 +722,9 @@ func (g *gui) updateEnvironment(status app.BootstrapStatus) {
 	}
 	g.stopButton.SetEnabled(status.Installed && status.Running && !g.busy)
 	g.removeButton.SetEnabled(status.Installed && !g.busy)
+	if g.logoutButton != nil {
+		g.logoutButton.SetEnabled(status.Installed && status.Healthy && !g.busy)
+	}
 	if g.loginRemoveButton != nil {
 		g.loginRemoveButton.SetEnabled(status.Installed && !g.busy)
 	}
@@ -1267,6 +1275,7 @@ func (g *gui) startDownloadRequest(request downloadRequest) {
 	_ = g.store.SaveSettings(g.settings)
 	g.retryRequest = &request
 	g.retryAfterLogin = false
+	g.downloadComplete = false
 
 	g.downloadButton.SetEnabled(false)
 	g.cancelButton.SetVisible(true)
@@ -1357,6 +1366,9 @@ func (g *gui) handleDownloadEvent(event app.DownloadEvent, receivedAt time.Time)
 		g.updateTaskStats(event.Phase)
 	case "progress":
 		if event.Phase == downloadCompletePhase {
+			// CLI 已报告整个任务完成；用户此刻关闭程序不应再被当作
+			// “操作进行中”而弹确认框。
+			g.downloadComplete = true
 			g.progressStats.CompleteDownload(event.Current, receivedAt)
 			g.updateTaskStats(downloadProgressPhase)
 			_ = g.taskProgress.SetMarqueeMode(false)
@@ -1393,6 +1405,7 @@ func (g *gui) handleDownloadEvent(event app.DownloadEvent, receivedAt time.Time)
 	case "error":
 		g.writeLogFile("错误：" + event.Message + formatDetail(event.Detail))
 	case "summary":
+		g.downloadComplete = true
 		g.progressStats.Reset()
 		g.updateTaskStats("")
 		g.taskDetail.SetText(fmt.Sprintf("完成 %d / %d，警告 %d，错误 %d", event.Success, event.Total, event.Warnings, event.Errors))
@@ -1663,6 +1676,35 @@ func (g *gui) stopRuntime() {
 	}()
 }
 
+func (g *gui) startLogout() {
+	if g.busy || g.bundleErr != nil {
+		return
+	}
+	answer := walk.MsgBox(g.mw, "退出 Apple ID",
+		"将清除专用环境中的 Apple ID 登录状态，下次下载前需要重新登录。是否继续？",
+		walk.MsgBoxYesNo|walk.MsgBoxIconWarning|walk.MsgBoxDefButton2)
+	if answer != walk.DlgCmdYes {
+		return
+	}
+	g.statusBar.SetText("正在退出 Apple ID")
+	ctx := g.beginOperation("logout", 3*time.Minute)
+	go func() {
+		response, err := (app.BootstrapClient{Bundle: g.bundle}).Invoke(ctx, "logout", nil)
+		g.sync(func() {
+			g.endOperation()
+			if g.shutdownRequested {
+				return
+			}
+			if err != nil {
+				g.showError("退出 Apple ID 失败", err, g.startLogout)
+				return
+			}
+			g.lastStatus = response.Status
+			g.showLogin("已退出 Apple ID，请重新登录")
+		})
+	}()
+}
+
 func (g *gui) removeRuntime() {
 	if g.busy {
 		return
@@ -1775,45 +1817,44 @@ func (g *gui) restartWindows() {
 }
 
 func (g *gui) stopRuntimeAndClose() {
-	if g.busy || g.shutdownPending || g.closeAllowed {
+	if g.shutdownPending || g.closeAllowed {
 		return
+	}
+	if g.busy && g.cancel != nil {
+		// 下载已结束但 CLI 进程还在收尾；直接终止它，不再询问用户。
+		g.cancel()
 	}
 	g.shutdownRequested = true
 	g.shutdownPending = true
 	g.statusBar.SetText("正在停止专用运行环境并退出")
-	ctx := g.beginOperation("shutdown", runtimeShutdownTimeout)
-	go func() {
-		err := stopManagedRuntime(ctx, app.BootstrapClient{Bundle: g.bundle})
-		g.sync(func() {
-			g.endOperation()
-			g.shutdownPending = false
-			exitOnError := false
-			if err != nil {
-				writeShutdownError(g.logsDir(), err)
-				answer := walk.MsgBox(g.mw, "无法停止运行环境",
-					friendlyMessage(err)+"\r\n\r\n是否仍然退出？",
-					walk.MsgBoxYesNo|walk.MsgBoxIconWarning|walk.MsgBoxDefButton2)
-				exitOnError = answer == walk.DlgCmdYes
-			}
-			closeAllowed, runtimeStopped := shutdownOutcome(err, exitOnError)
-			if !closeAllowed {
-				g.shutdownRequested = false
-				g.statusBar.SetText("退出已取消，可稍后重试")
-				return
-			}
-			if runtimeStopped {
-				g.loginPending = false
-				g.lastStatus.Running = false
-				g.lastStatus.Healthy = false
-				g.runtimeStopped = true
-				g.statusBar.SetText("专用运行环境已停止")
-			} else {
-				g.statusBar.SetText("正在退出，将再次尝试停止专用运行环境")
-			}
-			g.closeAllowed = true
-			g.mw.Close()
-		})
-	}()
+	// 停止专用发行版需要连续调用多次 wsl.exe（列出运行中发行版、校验所有权、
+	// 终止发行版），在 WSL2 虚拟机运行或挂起时会花掉数秒到十几秒。交给独立
+	// 进程在后台完成，主程序立即退出：窗口瞬间关闭，实例锁和程序文件随即
+	// 释放，重开程序不会被“程序已在运行”或“文件正在使用”阻塞。
+	g.detachedStop = startDetachedRuntimeStop(g.bundle)
+	g.closeAllowed = true
+	g.closed.Store(true)
+	g.mw.Close()
+}
+
+const createNoWindowFlag = 0x08000000
+
+// startDetachedRuntimeStop 启动一个独立的 AppleMusicWSL.exe stop 进程，由它
+// 在后台停止专用 WSL 发行版，主程序不等待。返回 false 表示分离进程未能启动
+// （例如安装包不完整），调用方应回退到进程内停止。
+func startDetachedRuntimeStop(bundle app.Bundle) bool {
+	if bundle.BootstrapExe == "" {
+		return false
+	}
+	command := exec.Command(bundle.BootstrapExe, "stop", "--json")
+	command.Dir = bundle.BootstrapDir
+	command.Env = append(os.Environ(), "APPLEMUSIC_BUNDLE_ROOT="+bundle.Root)
+	command.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindowFlag}
+	if err := command.Start(); err != nil {
+		return false
+	}
+	go func() { _ = command.Wait() }()
+	return true
 }
 
 func shutdownOutcome(stopErr error, exitOnError bool) (closeAllowed, runtimeStopped bool) {
@@ -1828,7 +1869,7 @@ func (g *gui) stopManagedRuntimeAfterWindow() {
 	if g.cancel != nil {
 		g.cancel()
 	}
-	if g.runtimeStopped {
+	if g.runtimeStopped || g.detachedStop {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), runtimeShutdownTimeout)
@@ -1853,7 +1894,7 @@ func (g *gui) onClosing(canceled *bool, reason walk.CloseReason) {
 		g.statusBar.SetText("正在取消当前操作并退出")
 		return
 	}
-	if !g.busy {
+	if !g.busy || (g.opKind == "download" && g.downloadComplete) {
 		g.stopRuntimeAndClose()
 		return
 	}

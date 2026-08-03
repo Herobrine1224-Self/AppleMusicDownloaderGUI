@@ -106,6 +106,9 @@ func run(args []string) int {
 		}
 		status, err := manager.SubmitTwoFactorCode(ctx, code)
 		return printStatusResult(status, err, *jsonOutput)
+	case "logout":
+		status, err := manager.Logout(ctx)
+		return printStatusResult(status, err, *jsonOutput)
 	case "stop":
 		err := manager.Stop(ctx)
 		if err == nil {
@@ -202,6 +205,7 @@ func printUsage() {
   applemusic-wsl start [--json]
   applemusic-wsl login [--json]
   applemusic-wsl submit-code [--json]
+  applemusic-wsl logout [--json]
   applemusic-wsl stop
   applemusic-wsl remove [--backup FILE] [--json]
 

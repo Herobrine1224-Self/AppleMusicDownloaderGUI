@@ -154,6 +154,34 @@ func TestStopRefusesRunningRuntimeWithForeignMarker(t *testing.T) {
 	}
 }
 
+func TestLogoutClearsLoginStateAndStopsRuntime(t *testing.T) {
+	manager, fake := newTestManager(t)
+	if _, err := manager.Install(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	fake.loginReady = true
+	terminateCount := fake.terminateCount
+	status, err := manager.Logout(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !status.Installed || !status.Owned || status.Running || status.Healthy {
+		t.Fatalf("unexpected logout status: %#v", status)
+	}
+	if fake.terminateCount != terminateCount+1 {
+		t.Fatalf("logout did not stop the runtime: terminate %d -> %d", terminateCount, fake.terminateCount)
+	}
+	cleared := false
+	for _, call := range fake.callsSnapshot() {
+		if strings.Contains(strings.Join(call.Args, " "), "rm -rf") {
+			cleared = true
+		}
+	}
+	if !cleared {
+		t.Fatal("logout did not clear Apple Music login data")
+	}
+}
+
 func TestStatusDoesNotInvokeWSLWhenPlatformMissing(t *testing.T) {
 	manager, fake := newTestManager(t)
 	if _, err := newAndSaveState(manager.Store, manager.Config, manager.Now()); err != nil {
@@ -804,6 +832,8 @@ func (f *simulatedWSLRunner) execCommand(command Command) (CommandResult, error)
 	case "/bin/sh":
 		script := strings.Join(args[execIndex+2:], " ")
 		switch {
+		case strings.Contains(script, "rm -rf"):
+			return CommandResult{ExitCode: 0}, nil
 		case strings.Contains(script, "STOREFRONT_ID"):
 			if f.loginReady {
 				return CommandResult{ExitCode: 0, Stdout: []byte("ready")}, nil

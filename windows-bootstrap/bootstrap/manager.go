@@ -765,9 +765,19 @@ func (m *Manager) Stop(ctx context.Context) error {
 		// 弹出安装窗口（例如程序退出时的自动停止）。
 		return nil
 	}
-	state, err := m.requireRegisteredState(ctx)
+	state, err := m.Store.Load()
+	if errors.Is(err, os.ErrNotExist) || state.Stage == StageRemoved || state.Stage == StageRemovalPrepared {
+		// 没有已部署的运行时，或移除流程已提交备份：无需停止任何发行版。
+		return nil
+	}
 	if err != nil {
 		return err
+	}
+	if err := validateStateOwner(state); err != nil {
+		return err
+	}
+	if err := validateManagedStateLayout(m.Config, state); err != nil {
+		return Wrap(CodeRepairRequired, "validate managed runtime state", err)
 	}
 	running, err := m.WSL.List(ctx, true)
 	if err != nil {
@@ -780,6 +790,35 @@ func (m *Manager) Stop(ctx context.Context) error {
 		return err
 	}
 	return Wrap(CodeCommand, "stop managed runtime", m.WSL.Terminate(ctx, state.DistroName))
+}
+
+// Logout 清除专用发行版内的 Apple Music 登录状态并停止 wrapper。登录数据被
+// 移除后，下一次 start 会返回 login_required，需要用户重新登录。
+func (m *Manager) Logout(ctx context.Context) (Status, error) {
+	unlock, err := m.Locker.Lock(ctx)
+	if err != nil {
+		return Status{}, Wrap(CodeConcurrentInstall, "lock runtime manager", err)
+	}
+	defer unlock()
+	state, err := m.requireOwnedState(ctx)
+	if err != nil {
+		return Status{}, err
+	}
+	// 先清除登录数据再停止 wrapper：wrapper 被终止后不会回写 token。
+	// 若发行版处于停止状态，exec 会先启动它，随后在末尾终止。
+	if err := m.WSL.ClearLoginData(ctx, state); err != nil {
+		return statusFromState(state), Wrap(CodeCommand, "clear Apple Music login state", err)
+	}
+	_ = m.WSL.RemovePrivateFile(ctx, state, LoginPendingLinuxPath)
+	if err := m.WSL.Terminate(ctx, state.DistroName); err != nil {
+		return statusFromState(state), Wrap(CodeCommand, "stop runtime after logout", err)
+	}
+	status := statusFromState(state)
+	status.Installed = true
+	status.Owned = true
+	status.Running = false
+	status.Healthy = false
+	return status, nil
 }
 
 func (m *Manager) RemoveWithBackup(ctx context.Context, backupPath string) (string, error) {
