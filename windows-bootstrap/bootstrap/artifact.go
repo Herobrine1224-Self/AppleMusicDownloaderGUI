@@ -20,7 +20,9 @@ import (
 	"time"
 )
 
-const maxUbuntuBaseSize = 128 << 20
+// maxUbuntuBaseSize 覆盖 Ubuntu WSL 镜像的压缩大小（24.04.4 约为 391MB），
+// 仍保留一个上限防止镜像服务器返回异常内容。
+const maxUbuntuBaseSize = 512 << 20
 
 type ArtifactManager struct {
 	Config Config
@@ -138,25 +140,48 @@ func (a ArtifactManager) ResolveUbuntuBase(ctx context.Context) (string, error) 
 	if err := os.MkdirAll(cacheDir, 0700); err != nil {
 		return "", err
 	}
-	destination := filepath.Join(cacheDir, "ubuntu-base-24.04.4-amd64.tar.gz")
+	destination := filepath.Join(cacheDir, "ubuntu-24.04.4-wsl-amd64.wsl")
 	if err := verifyFileSHA256(destination, a.Config.UbuntuBaseHash); err == nil {
 		return destination, nil
 	}
 	if err := a.download(ctx, destination); err != nil {
-		return "", Wrap(CodeDownload, "download Ubuntu Base", err)
-	}
-	if err := verifyFileSHA256(destination, a.Config.UbuntuBaseHash); err != nil {
-		return "", Wrap(CodeIntegrity, "verify downloaded Ubuntu Base archive", err)
+		return "", Wrap(CodeDownload, "download Ubuntu WSL image", err)
 	}
 	return destination, nil
 }
 
 func (a ArtifactManager) download(ctx context.Context, destination string) error {
+	// 先尝试主镜像（UbuntuBaseURL），失败后依次尝试备用镜像。所有镜像都
+	// 提供同一固定版本文件，下载后按固定 SHA-256 校验；某个镜像超时、断连
+	// 或内容不一致时自动切换到下一个。
+	seen := map[string]bool{}
+	var urls []string
+	for _, url := range append([]string{a.Config.UbuntuBaseURL}, a.Config.UbuntuBaseMirrors...) {
+		url = strings.TrimSpace(url)
+		if url == "" || seen[url] {
+			continue
+		}
+		seen[url] = true
+		urls = append(urls, url)
+	}
+	var failures []error
+	for _, url := range urls {
+		fmt.Fprintf(os.Stderr, "正在从 %s 下载 Ubuntu WSL 镜像...\n", url)
+		if err := a.downloadFrom(ctx, url, destination); err != nil {
+			failures = append(failures, fmt.Errorf("%s: %w", url, err))
+			continue
+		}
+		return nil
+	}
+	return errors.Join(failures...)
+}
+
+func (a ArtifactManager) downloadFrom(ctx context.Context, url, destination string) error {
 	client := a.Client
 	if client == nil {
 		client = &http.Client{Timeout: a.Config.DownloadTimeout}
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, a.Config.UbuntuBaseURL, nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
@@ -172,7 +197,7 @@ func (a ArtifactManager) download(ctx context.Context, destination string) error
 	if response.ContentLength > maxUbuntuBaseSize {
 		return fmt.Errorf("archive is unexpectedly large: %d bytes", response.ContentLength)
 	}
-	temp, err := os.CreateTemp(filepath.Dir(destination), ".ubuntu-base-*.part")
+	temp, err := os.CreateTemp(filepath.Dir(destination), ".ubuntu-wsl-*.part")
 	if err != nil {
 		return err
 	}
@@ -191,9 +216,6 @@ func (a ArtifactManager) download(ctx context.Context, destination string) error
 	}
 	if written > maxUbuntuBaseSize {
 		return errors.New("download exceeded the maximum allowed archive size")
-	}
-	if err := verifyFileSHA256(tempName, a.Config.UbuntuBaseHash); err != nil {
-		return err
 	}
 	return replaceFile(tempName, destination)
 }

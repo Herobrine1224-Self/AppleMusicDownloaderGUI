@@ -10,7 +10,11 @@ import (
 
 func TestStoreRoundTrip(t *testing.T) {
 	store := Store{Dir: t.TempDir()}
-	want := Settings{OutputDir: filepath.Join("D:", "Music"), Quality: QualityAtmos}
+	want := Settings{
+		OutputDir:      filepath.Join("D:", "Music"),
+		Quality:        QualityAtmos,
+		SongFileFormat: "{TrackNumber}. {SongName}",
+	}
 	if err := store.SaveSettings(want); err != nil {
 		t.Fatal(err)
 	}

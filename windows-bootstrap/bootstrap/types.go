@@ -17,10 +17,22 @@ const (
 	LoginPendingLinuxPath     = "/run/applemusic-login.pending"
 	TwoFactorLinuxPath        = LoginDataLinuxDir + "/2fa.txt"
 
-	UbuntuBaseURL    = "https://cdimage.ubuntu.com/ubuntu-base/releases/24.04.4/release/ubuntu-base-24.04.4-base-amd64.tar.gz"
-	UbuntuBaseSHA256 = "c1e67ef7b17a6300e136118bd1dc04725009cb376c1aad10abcf8cd453628d58"
+	// UbuntuBaseURL 优先使用国内镜像，避免从国外服务器下载过慢或失败。文件
+	// 是 Ubuntu 官方发布的 WSL 镜像（gzip tar 根文件系统），内容与官方
+	// releases 完全一致（固定 SHA-256 校验），下载失败时依次尝试
+	// UbuntuBaseMirrors 中的备用镜像。
+	UbuntuBaseURL    = "https://mirrors.ustc.edu.cn/ubuntu-releases/24.04.3/ubuntu-24.04.4-wsl-amd64.wsl"
+	UbuntuBaseSHA256 = "9b2f7730dc68227dd04a9f3e5eab86ad85caf556b8606ad94f1f29ff5c4fd3f5"
 	PayloadSHA256    = "5dbc716180ca3df310f040b62f338d09f717390e8e1fe5687475a7af16f5113b"
 )
+
+// UbuntuBaseMirrors 是 UbuntuBaseURL 下载失败后的备用镜像，全部托管与官方
+// releases 相同的固定版本文件。
+var UbuntuBaseMirrors = []string{
+	"https://mirrors.aliyun.com/ubuntu-releases/24.04.4/ubuntu-24.04.4-wsl-amd64.wsl",
+	"https://mirrors.huaweicloud.com/ubuntu-releases/24.04.4/ubuntu-24.04.4-wsl-amd64.wsl",
+	"https://releases.ubuntu.com/24.04.4/ubuntu-24.04.4-wsl-amd64.wsl",
+}
 
 type Stage string
 
@@ -79,16 +91,17 @@ type Status struct {
 }
 
 type Config struct {
-	AppDataDir      string
-	PayloadDir      string
-	UbuntuBasePath  string
-	UbuntuBaseURL   string
-	UbuntuBaseHash  string
-	PayloadHash     string
-	RuntimeVersion  string
-	DownloadTimeout time.Duration
-	CommandTimeout  time.Duration
-	StartupTimeout  time.Duration
+	AppDataDir        string
+	PayloadDir        string
+	UbuntuBasePath    string
+	UbuntuBaseURL     string
+	UbuntuBaseMirrors []string
+	UbuntuBaseHash    string
+	PayloadHash       string
+	RuntimeVersion    string
+	DownloadTimeout   time.Duration
+	CommandTimeout    time.Duration
+	StartupTimeout    time.Duration
 }
 
 type Command struct {

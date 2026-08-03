@@ -84,6 +84,108 @@ func TestStatusDoesNotStartStoppedRuntime(t *testing.T) {
 	}
 }
 
+func TestStopDoesNotStartStoppedRuntime(t *testing.T) {
+	manager, fake := newTestManager(t)
+	if _, err := manager.Install(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	fake.foreignMarker = true
+	execCount := fake.execCount
+	terminateCount := fake.terminateCount
+	if err := manager.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if fake.running {
+		t.Fatal("Stop() started a stopped runtime")
+	}
+	if fake.execCount != execCount {
+		t.Fatalf("Stop() entered a stopped distro: exec count %d -> %d", execCount, fake.execCount)
+	}
+	if fake.terminateCount != terminateCount {
+		t.Fatalf("Stop() terminated a stopped distro: terminate count %d -> %d", terminateCount, fake.terminateCount)
+	}
+}
+
+func TestStopTerminatesOnlyRunningOwnedRuntime(t *testing.T) {
+	manager, fake := newTestManager(t)
+	if _, err := manager.Install(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	fake.running = true
+	execCount := fake.execCount
+	terminateCount := fake.terminateCount
+	callCount := len(fake.callsSnapshot())
+	if err := manager.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if fake.running {
+		t.Fatal("Stop() left the managed runtime running")
+	}
+	if fake.execCount != execCount+1 {
+		t.Fatalf("ownership checks = %d, want %d", fake.execCount, execCount+1)
+	}
+	if fake.terminateCount != terminateCount+1 {
+		t.Fatalf("terminations = %d, want %d", fake.terminateCount, terminateCount+1)
+	}
+	for _, call := range fake.callsSnapshot()[callCount:] {
+		joined := strings.Join(call.Args, " ")
+		if strings.Contains(joined, "--shutdown") || targetsDistro(call.Args, "Ubuntu") {
+			t.Fatalf("Stop() targeted WSL outside the managed runtime: %s", joined)
+		}
+	}
+}
+
+func TestStopRefusesRunningRuntimeWithForeignMarker(t *testing.T) {
+	manager, fake := newTestManager(t)
+	if _, err := manager.Install(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	fake.running = true
+	fake.foreignMarker = true
+	terminateCount := fake.terminateCount
+	if err := manager.Stop(context.Background()); ErrorCodeOf(err) != CodeOwnership {
+		t.Fatalf("Stop() error = %v, want CodeOwnership", err)
+	}
+	if fake.terminateCount != terminateCount {
+		t.Fatalf("Stop() terminated an unowned runtime: %d -> %d", terminateCount, fake.terminateCount)
+	}
+	if !fake.running {
+		t.Fatal("Stop() changed the state of an unowned runtime")
+	}
+}
+
+func TestStatusDoesNotInvokeWSLWhenPlatformMissing(t *testing.T) {
+	manager, fake := newTestManager(t)
+	if _, err := newAndSaveState(manager.Store, manager.Config, manager.Now()); err != nil {
+		t.Fatal(err)
+	}
+	manager.platformProbe = func() bool { return false }
+	status, err := manager.Status(context.Background())
+	if ErrorCodeOf(err) != CodePlatform {
+		t.Fatalf("Status() error = %v, want CodePlatform", err)
+	}
+	if status.Installed {
+		t.Fatal("Status() reported an installed runtime without a WSL platform")
+	}
+	if got := len(fake.callsSnapshot()); got != 0 {
+		t.Fatalf("Status() invoked wsl.exe %d time(s) while the platform is missing", got)
+	}
+}
+
+func TestStopDoesNotInvokeWSLWhenPlatformMissing(t *testing.T) {
+	manager, fake := newTestManager(t)
+	if _, err := newAndSaveState(manager.Store, manager.Config, manager.Now()); err != nil {
+		t.Fatal(err)
+	}
+	manager.platformProbe = func() bool { return false }
+	if err := manager.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop() error = %v, want success when there is no WSL platform", err)
+	}
+	if got := len(fake.callsSnapshot()); got != 0 {
+		t.Fatalf("Stop() invoked wsl.exe %d time(s) while the platform is missing", got)
+	}
+}
+
 func TestStatusDoesNotQueryRemovedDistroName(t *testing.T) {
 	manager, fake := newTestManager(t)
 	if _, err := manager.Install(context.Background()); err != nil {
@@ -162,6 +264,34 @@ func TestInstallStopsBeforeDownloadWhenPlatformIsUnavailable(t *testing.T) {
 	}
 	if state.Stage != StagePlatformPending {
 		t.Fatalf("state stage = %s, want %s", state.Stage, StagePlatformPending)
+	}
+}
+
+func TestInstallRotatesStaleStateWhenBaseHashChangedBeforeRegistration(t *testing.T) {
+	manager, fake := newTestManager(t)
+	state, err := newAndSaveState(manager.Store, manager.Config, manager.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.Stage = StagePlatformPending
+	state.UbuntuBaseSHA256 = "old-ubuntu-base-hash"
+	if err := manager.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	fake.platformReady = false
+	_, err = manager.Install(context.Background())
+	if ErrorCodeOf(err) != CodePlatform {
+		t.Fatalf("Install() error = %v, want CodePlatform", err)
+	}
+	next, err := manager.Store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.InstanceID == state.InstanceID {
+		t.Fatal("stale pre-registration state was not rotated to a fresh instance")
+	}
+	if next.UbuntuBaseSHA256 != manager.Config.UbuntuBaseHash {
+		t.Fatalf("rotated state base hash = %q, want %q", next.UbuntuBaseSHA256, manager.Config.UbuntuBaseHash)
 	}
 }
 
@@ -487,13 +617,16 @@ func newTestManager(t *testing.T) (*Manager, *simulatedWSLRunner) {
 	fake := &simulatedWSLRunner{platformReady: true, store: store}
 	wsl := WSLClient{Runner: fake, WSLPath: `C:\Windows\System32\wsl.exe`}
 	manager := &Manager{
-		Config:    config,
-		Runner:    fake,
-		WSL:       wsl,
-		Artifacts: ArtifactManager{Config: config},
-		Store:     store,
-		Locker:    immediateLock{},
-		Now:       func() time.Time { return time.Unix(1700000000, 0) },
+		Config:        config,
+		Runner:        fake,
+		WSL:           wsl,
+		Artifacts:     ArtifactManager{Config: config},
+		Store:         store,
+		Locker:        immediateLock{},
+		Now:           func() time.Time { return time.Unix(1700000000, 0) },
+		healthProbe:   func(context.Context) bool { return false },
+		portProbe:     func(string) bool { return false },
+		platformProbe: func() bool { return true },
 	}
 	return manager, fake
 }

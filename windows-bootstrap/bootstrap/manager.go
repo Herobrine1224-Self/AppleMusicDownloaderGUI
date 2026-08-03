@@ -19,13 +19,16 @@ import (
 )
 
 type Manager struct {
-	Config    Config
-	Runner    Runner
-	WSL       WSLClient
-	Artifacts ArtifactManager
-	Store     StateStore
-	Locker    Locker
-	Now       func() time.Time
+	Config        Config
+	Runner        Runner
+	WSL           WSLClient
+	Artifacts     ArtifactManager
+	Store         StateStore
+	Locker        Locker
+	Now           func() time.Time
+	healthProbe   func(context.Context) bool
+	portProbe     func(string) bool
+	platformProbe func() bool
 }
 
 const incompleteImportGracePeriod = 2 * time.Minute
@@ -48,13 +51,16 @@ func NewManager(config Config) (*Manager, error) {
 		return nil, err
 	}
 	return &Manager{
-		Config:    config,
-		Runner:    runner,
-		WSL:       wsl,
-		Artifacts: ArtifactManager{Config: config},
-		Store:     StateStore{Path: filepath.Join(config.AppDataDir, "bootstrap-state.json")},
-		Locker:    NamedMutex{Name: managedMutexName(ownerSID)},
-		Now:       time.Now,
+		Config:        config,
+		Runner:        runner,
+		WSL:           wsl,
+		Artifacts:     ArtifactManager{Config: config},
+		Store:         StateStore{Path: filepath.Join(config.AppDataDir, "bootstrap-state.json")},
+		Locker:        NamedMutex{Name: managedMutexName(ownerSID)},
+		Now:           time.Now,
+		healthProbe:   runtimeHealthy,
+		portProbe:     portInUse,
+		platformProbe: wslInstalledWithoutProbe,
 	}, nil
 }
 
@@ -91,7 +97,7 @@ func (m *Manager) Install(ctx context.Context) (Status, error) {
 	if !platformReady {
 		state.Stage = StagePlatformPending
 		_ = m.Store.Save(state)
-		return statusFromState(state), Wrap(CodePlatform, "probe WSL platform", errors.New("WSL optional components are not ready; run the elevated platform helper"))
+		return statusFromState(state), Wrap(CodePlatform, "probe WSL platform", errors.New("WSL is not installed; install WSL2 manually (run \"wsl --install\" as administrator and restart Windows), then retry"))
 	}
 
 	reconcileAttempts := 0
@@ -123,7 +129,7 @@ checkManagedDistribution:
 			status.Installed = true
 			status.Owned = true
 			status.Running = wasRunning
-			status.Healthy = wasRunning && runtimeHealthy(ctx)
+			status.Healthy = wasRunning && m.runtimeHealthy(ctx)
 			return status, nil
 		}
 		return m.finishExistingInstall(ctx, state)
@@ -219,6 +225,20 @@ func (m *Manager) loadOrCreateState() (State, error) {
 			return State{}, Wrap(CodeRepairRequired, "resume bootstrap state", fmt.Errorf("runtime removal already has a verified backup at %s; run remove again to finish", state.LastBackupPath))
 		}
 		if state.RuntimeVersion != m.Config.RuntimeVersion || state.PayloadSHA256 != m.Config.PayloadHash || state.UbuntuBaseSHA256 != m.Config.UbuntuBaseHash {
+			// 从未导入过发行版时（prepared / platform_pending），旧状态只记录
+			// 一次未完成的部署。镜像或 payload 更新后直接以新实例重新开始，
+			// 不需要用户手动清理状态文件。
+			if state.Stage == StagePrepared || state.Stage == StagePlatformPending {
+				next, createErr := newState(m.Config, m.Now())
+				if createErr != nil {
+					return State{}, createErr
+				}
+				next.RecoveryPaths = append([]string(nil), state.RecoveryPaths...)
+				if saveErr := m.Store.Save(next); saveErr != nil {
+					return State{}, saveErr
+				}
+				return next, nil
+			}
 			return State{}, Wrap(CodeRepairRequired, "resume bootstrap state", errors.New("the saved runtime version or artifact hashes differ from this bootstrap build; explicit upgrade handling is required"))
 		}
 		if err := validateStateOwner(state); err != nil {
@@ -423,6 +443,12 @@ func (m *Manager) Status(ctx context.Context) (Status, error) {
 		status.Detail = "managed distribution was removed after a verified backup"
 		return status, nil
 	}
+	if !m.wslPlatformPresent() {
+		// wsl.exe 在 WSL 组件缺失时会弹出"按任意键安装 WSL"的控制台窗口并
+		// 等待最多一分钟。状态查询只负责提示用户自行安装 WSL，不应触发该窗口。
+		status.Detail = "WSL is not installed; install WSL2 manually and restart Windows"
+		return status, Wrap(CodePlatform, "probe WSL platform", errors.New("WSL is not installed; install WSL2 manually (run \"wsl --install\" as administrator and restart Windows), then retry"))
+	}
 	distros, err := m.WSL.List(ctx, false)
 	if err != nil {
 		return status, Wrap(CodePlatform, "list WSL distributions", err)
@@ -438,7 +464,7 @@ func (m *Manager) Status(ctx context.Context) (Status, error) {
 	}
 	status.Running = containsDistro(running, state.DistroName)
 	if !status.Running {
-		status.Detail = "a distribution with the managed name is registered but stopped; ownership will be rechecked before start, stop, or removal"
+		status.Detail = "a distribution with the managed name is registered but stopped; ownership will be rechecked before start or removal, and before terminating a running instance"
 		return status, nil
 	}
 	if err := m.WSL.VerifyOwner(ctx, state); err != nil {
@@ -446,7 +472,7 @@ func (m *Manager) Status(ctx context.Context) (Status, error) {
 		return status, err
 	}
 	status.Owned = true
-	status.Healthy = runtimeHealthy(ctx)
+	status.Healthy = m.runtimeHealthy(ctx)
 	return status, nil
 }
 
@@ -460,7 +486,7 @@ func (m *Manager) Start(ctx context.Context) (Status, error) {
 	if err != nil {
 		return Status{}, err
 	}
-	if runtimeHealthy(ctx) {
+	if m.runtimeHealthy(ctx) {
 		status := statusFromState(state)
 		status.Installed, status.Owned, status.Running, status.Healthy = true, true, true, true
 		return status, nil
@@ -473,13 +499,13 @@ func (m *Manager) Start(ctx context.Context) (Status, error) {
 		_ = m.WSL.Terminate(ctx, state.DistroName)
 		return statusFromState(state), Wrap(CodeLoginRequired, "start wrapper", errors.New("this private runtime has not completed Apple Music login; run login first"))
 	}
-	if portInUse("127.0.0.1:10020") || portInUse("127.0.0.1:20020") || portInUse("127.0.0.1:30020") {
+	if m.portInUse("127.0.0.1:10020") || m.portInUse("127.0.0.1:20020") || m.portInUse("127.0.0.1:30020") {
 		// A previously requested wrapper may still be completing network login.
 		// Give that single instance time to become healthy before reporting a
 		// conflict. The launcher also uses an atomic /run lock as a second guard.
 		deadline := time.Now().Add(m.Config.StartupTimeout)
 		for time.Now().Before(deadline) {
-			if runtimeHealthy(ctx) {
+			if m.runtimeHealthy(ctx) {
 				status := statusFromState(state)
 				status.Installed, status.Owned, status.Running, status.Healthy = true, true, true, true
 				return status, nil
@@ -492,7 +518,7 @@ func (m *Manager) Start(ctx context.Context) (Status, error) {
 		}
 		return statusFromState(state), Wrap(CodePortConflict, "start wrapper", errors.New("one or more required localhost ports are occupied by an unhealthy process"))
 	}
-	logDir := filepath.Join(m.Config.AppDataDir, "logs")
+	logDir := m.logsDir()
 	if err := os.MkdirAll(logDir, 0700); err != nil {
 		return Status{}, err
 	}
@@ -511,7 +537,7 @@ func (m *Manager) Start(ctx context.Context) (Status, error) {
 
 	deadline := time.Now().Add(m.Config.StartupTimeout)
 	for time.Now().Before(deadline) {
-		if runtimeHealthy(ctx) {
+		if m.runtimeHealthy(ctx) {
 			status := statusFromState(state)
 			status.Installed, status.Owned, status.Running, status.Healthy = true, true, true, true
 			status.LogPath = logPath
@@ -539,7 +565,7 @@ func (m *Manager) Login(ctx context.Context, username, password string) (Status,
 	if err != nil {
 		return Status{}, err
 	}
-	if runtimeHealthy(ctx) {
+	if m.runtimeHealthy(ctx) {
 		return healthyStatus(state, ""), nil
 	}
 	// A fresh login replaces any failed or pending wrapper only inside this
@@ -547,7 +573,7 @@ func (m *Manager) Login(ctx context.Context, username, password string) (Status,
 	if err := m.WSL.Terminate(ctx, state.DistroName); err != nil {
 		return statusFromState(state), Wrap(CodeCommand, "reset managed runtime before login", err)
 	}
-	if portInUse("127.0.0.1:10020") || portInUse("127.0.0.1:20020") || portInUse("127.0.0.1:30020") {
+	if m.portInUse("127.0.0.1:10020") || m.portInUse("127.0.0.1:20020") || m.portInUse("127.0.0.1:30020") {
 		return statusFromState(state), Wrap(CodePortConflict, "start Apple Music login", errors.New("one or more required localhost ports are occupied"))
 	}
 	credentials := []byte(username + "\n" + password + "\n")
@@ -587,7 +613,7 @@ func (m *Manager) SubmitTwoFactorCode(ctx context.Context, code string) (Status,
 	if err != nil {
 		return Status{}, err
 	}
-	if runtimeHealthy(ctx) {
+	if m.runtimeHealthy(ctx) {
 		return healthyStatus(state, ""), nil
 	}
 	pending, err := m.WSL.HasPendingLogin(ctx, state)
@@ -597,7 +623,7 @@ func (m *Manager) SubmitTwoFactorCode(ctx context.Context, code string) (Status,
 	if !pending {
 		return statusFromState(state), Wrap(CodeLoginFailed, "submit two-factor code", errors.New("no Apple Music login is waiting for a two-factor code"))
 	}
-	logPath := filepath.Join(m.Config.AppDataDir, "logs", "wrapper.log")
+	logPath := filepath.Join(m.logsDir(), "wrapper.log")
 	logOffset := int64(0)
 	if info, statErr := os.Stat(logPath); statErr == nil {
 		logOffset = info.Size()
@@ -614,7 +640,7 @@ func (m *Manager) SubmitTwoFactorCode(ctx context.Context, code string) (Status,
 func (m *Manager) waitForLogin(ctx context.Context, state State, logPath string, logOffset int64) (Status, error) {
 	deadline := time.Now().Add(m.Config.StartupTimeout)
 	for time.Now().Before(deadline) {
-		if runtimeHealthy(ctx) {
+		if m.runtimeHealthy(ctx) {
 			_ = m.WSL.RemovePrivateFile(ctx, state, LoginPendingLinuxPath)
 			return healthyStatus(state, logPath), nil
 		}
@@ -649,7 +675,7 @@ func (m *Manager) waitForLogin(ctx context.Context, state State, logPath string,
 }
 
 func (m *Manager) openRuntimeLog(operation string) (string, *os.File, int64, error) {
-	logDir := filepath.Join(m.Config.AppDataDir, "logs")
+	logDir := m.logsDir()
 	if err := os.MkdirAll(logDir, 0700); err != nil {
 		return "", nil, 0, err
 	}
@@ -668,6 +694,16 @@ func (m *Manager) openRuntimeLog(operation string) (string, *os.File, int64, err
 		return "", nil, 0, err
 	}
 	return logPath, logFile, info.Size(), nil
+}
+
+// logsDir returns the directory used for runtime logs. When the GUI passes
+// APPLEMUSIC_BUNDLE_ROOT (the directory containing the program), logs are kept
+// next to the program; otherwise fall back to the per-user AppData directory.
+func (m *Manager) logsDir() string {
+	if root := os.Getenv("APPLEMUSIC_BUNDLE_ROOT"); root != "" {
+		return filepath.Join(root, "logs")
+	}
+	return filepath.Join(m.Config.AppDataDir, "logs")
 }
 
 func readLogFrom(name string, offset int64) (string, error) {
@@ -724,8 +760,23 @@ func (m *Manager) Stop(ctx context.Context) error {
 		return Wrap(CodeConcurrentInstall, "lock runtime manager", err)
 	}
 	defer unlock()
-	state, err := m.requireOwnedState(ctx)
+	if !m.wslPlatformPresent() {
+		// WSL 组件缺失时没有可停止的发行版；直接成功返回，避免 wsl.exe
+		// 弹出安装窗口（例如程序退出时的自动停止）。
+		return nil
+	}
+	state, err := m.requireRegisteredState(ctx)
 	if err != nil {
+		return err
+	}
+	running, err := m.WSL.List(ctx, true)
+	if err != nil {
+		return Wrap(CodeCommand, "read managed runtime state", err)
+	}
+	if !containsDistro(running, state.DistroName) {
+		return nil
+	}
+	if err := m.WSL.VerifyOwner(ctx, state); err != nil {
 		return err
 	}
 	return Wrap(CodeCommand, "stop managed runtime", m.WSL.Terminate(ctx, state.DistroName))
@@ -992,6 +1043,20 @@ func pathIsWithin(parent, candidate string) (bool, error) {
 }
 
 func (m *Manager) requireOwnedState(ctx context.Context) (State, error) {
+	state, err := m.requireRegisteredState(ctx)
+	if err != nil {
+		return State{}, err
+	}
+	if err := m.WSL.VerifyOwner(ctx, state); err != nil {
+		return State{}, err
+	}
+	return state, nil
+}
+
+func (m *Manager) requireRegisteredState(ctx context.Context) (State, error) {
+	if !m.wslPlatformPresent() {
+		return State{}, Wrap(CodePlatform, "probe WSL platform", errors.New("WSL is not installed; install WSL2 manually (run \"wsl --install\" as administrator and restart Windows), then retry"))
+	}
 	state, err := m.Store.Load()
 	if errors.Is(err, os.ErrNotExist) || state.Stage == StageRemoved {
 		return State{}, Wrap(CodeNotInstalled, "load managed runtime", errors.New("runtime is not installed"))
@@ -1011,9 +1076,6 @@ func (m *Manager) requireOwnedState(ctx context.Context) (State, error) {
 	}
 	if !containsDistro(distros, state.DistroName) {
 		return State{}, Wrap(CodeNotInstalled, "locate managed runtime", errors.New("recorded distribution is not registered"))
-	}
-	if err := m.WSL.VerifyOwner(ctx, state); err != nil {
-		return State{}, err
 	}
 	return state, nil
 }
@@ -1053,6 +1115,27 @@ func runtimeHealthy(ctx context.Context) bool {
 		return false
 	}
 	return portInUse("127.0.0.1:10020") && portInUse("127.0.0.1:20020")
+}
+
+func (m *Manager) runtimeHealthy(ctx context.Context) bool {
+	if m.healthProbe != nil {
+		return m.healthProbe(ctx)
+	}
+	return runtimeHealthy(ctx)
+}
+
+func (m *Manager) wslPlatformPresent() bool {
+	if m.platformProbe != nil {
+		return m.platformProbe()
+	}
+	return wslInstalledWithoutProbe()
+}
+
+func (m *Manager) portInUse(address string) bool {
+	if m.portProbe != nil {
+		return m.portProbe(address)
+	}
+	return portInUse(address)
 }
 
 func portInUse(address string) bool {

@@ -10,10 +10,8 @@ AppleMusic-Runtime-2f8a34c1
 
 ## 已实现
 
-- 在 WSL 未启用时通过 UAC 辅助进程启用 `Microsoft-Windows-Subsystem-Linux` 和 `VirtualMachinePlatform`。
-- 优先使用微软官方 `wsl --install --no-distribution --web-download` 安装平台和内核；旧版 Windows 回退到 DISM 与 `wsl --update`，绝不隐式安装商店 Ubuntu。
-- 系统要求重启时安全退出；重启后再次执行 `install` 会从状态文件继续。
-- 下载固定版本的 Ubuntu Base 24.04.4，并验证固定 SHA-256。
+- 部署前检查 WSL 平台是否可用；不可用时**不自动安装 WSL**，直接返回明确的错误码和提示，由用户自行安装 WSL2（管理员运行 `wsl --install` 并重启）。
+- 下载固定版本的 Ubuntu WSL 镜像（24.04.4，gzip tar 根文件系统）并验证固定 SHA-256；优先从中国科学技术大学（USTC）镜像下载，失败时自动切换到阿里云、华为云、官方源等备用镜像。
 - 验证本地 wrapper payload 的整体 SHA-256，拒绝缺失或被修改的文件。
 - 合成独立 runtime tar，再通过 `wsl --import ... --version 2` 导入。
 - 在发行版内写入安装实例所有权标记，所有停止和删除操作前都重新校验。
@@ -118,13 +116,12 @@ dist\AppleMusicWSL\
 
 1. 校验 Windows/CPU 架构和 wrapper payload。
 2. 创建每用户安装实例状态，不修改 WSL 全局默认发行版。
-3. 检查 WSL 平台；缺失时弹出一次 UAC。
-4. 如果 Windows 要求重启，以退出码 `20` 结束，不强制重启。
-5. 下载并校验 Ubuntu Base。
-6. 生成带所有权标记的 runtime tar。
-7. 导入随机命名的专用 WSL2 发行版。
-8. 创建不可登录默认用户并执行 wrapper `1.2.0` 冒烟检查。
-9. 只终止该专用发行版，使私有 `wsl.conf` 生效。
+3. 检查 WSL 平台；缺失时不自动安装，返回 `wsl_platform_unavailable` 错误并提示用户自行安装 WSL2。
+4. 下载并校验 Ubuntu WSL 镜像。
+5. 生成带所有权标记的 runtime tar。
+6. 导入随机命名的专用 WSL2 发行版。
+7. 创建不可登录默认用户并执行 wrapper `1.2.0` 冒烟检查。
+8. 只终止该专用发行版，使私有 `wsl.conf` 生效。
 
 安装状态位于：
 

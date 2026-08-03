@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -32,14 +33,22 @@ type BootstrapClient struct {
 	Bundle Bundle
 }
 
-func (c BootstrapClient) Invoke(ctx context.Context, operation string, stdin []byte) (BootstrapResponse, error) {
-	command := hiddenCommand(ctx, c.Bundle.BootstrapExe, operation, "--json")
+func (c BootstrapClient) Invoke(ctx context.Context, operation string, stdin []byte, extraArgs ...string) (BootstrapResponse, error) {
+	args := []string{operation, "--json"}
+	args = append(args, extraArgs...)
+	command := hiddenCommand(ctx, c.Bundle.BootstrapExe, args...)
 	command.Dir = c.Bundle.BootstrapDir
+	command.Env = append(os.Environ(), "APPLEMUSIC_BUNDLE_ROOT="+c.Bundle.Root)
 	command.Stdin = bytes.NewReader(stdin)
 	var stdout, stderr bytes.Buffer
 	command.Stdout = &stdout
 	command.Stderr = &stderr
-	runErr := command.Run()
+	var runErr error
+	if operation == "stop" {
+		runErr = runCommandInKillOnCloseJob(command)
+	} else {
+		runErr = command.Run()
+	}
 	response, decodeErr := DecodeBootstrapResponse(stdout.Bytes())
 	if decodeErr != nil {
 		if ctx.Err() != nil {
@@ -71,13 +80,134 @@ func exitCode(err error) int {
 	return 0
 }
 
+func runCommandInKillOnCloseJob(command *exec.Cmd) error {
+	if command.SysProcAttr == nil {
+		command.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	command.SysProcAttr.CreationFlags |= windows.CREATE_SUSPENDED
+	if err := command.Start(); err != nil {
+		return err
+	}
+	closeJob, jobErr := assignKillOnCloseJob(command.Process.Pid)
+	if jobErr != nil {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		return fmt.Errorf("assign bootstrap stop to cleanup job: %w", jobErr)
+	}
+	if err := resumeProcess(command.Process.Pid); err != nil {
+		closeJob()
+		_ = command.Wait()
+		return fmt.Errorf("resume bootstrap stop in cleanup job: %w", err)
+	}
+	runErr := command.Wait()
+	closeJob()
+	return runErr
+}
+
+func resumeProcess(pid int) error {
+	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(snapshot)
+
+	entry := windows.ThreadEntry32{Size: uint32(unsafe.Sizeof(windows.ThreadEntry32{}))}
+	if err := windows.Thread32First(snapshot, &entry); err != nil {
+		return err
+	}
+	for {
+		if entry.OwnerProcessID == uint32(pid) {
+			thread, err := windows.OpenThread(windows.THREAD_SUSPEND_RESUME, false, entry.ThreadID)
+			if err != nil {
+				return err
+			}
+			_, resumeErr := windows.ResumeThread(thread)
+			_ = windows.CloseHandle(thread)
+			return resumeErr
+		}
+		entry.Size = uint32(unsafe.Sizeof(entry))
+		if err := windows.Thread32Next(snapshot, &entry); err != nil {
+			if errors.Is(err, windows.ERROR_NO_MORE_FILES) {
+				return fmt.Errorf("no thread found for process %d", pid)
+			}
+			return err
+		}
+	}
+}
+
 type DownloadOptions struct {
-	Link      LinkInfo
-	OutputDir string
-	Quality   string
-	TaskID    string
-	OnEvent   func(DownloadEvent)
-	OnLog     func(string)
+	Link           LinkInfo
+	OutputDir      string
+	Quality        string
+	SongFileFormat string
+	SelectIndexes  string
+	TaskID         string
+	OnEvent        func(DownloadEvent)
+	OnLog          func(string)
+}
+
+type TrackItem struct {
+	Index       int    `json:"index"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Artist      string `json:"artist"`
+	Album       string `json:"album"`
+	TrackNumber int    `json:"track_number"`
+	DiscNumber  int    `json:"disc_number"`
+	DurationMs  int    `json:"duration_ms"`
+	Type        string `json:"type"`
+}
+
+type TrackGroup struct {
+	URL    string      `json:"url"`
+	Title  string      `json:"title"`
+	Artist string      `json:"artist"`
+	Tracks []TrackItem `json:"tracks"`
+}
+
+func ListTracks(ctx context.Context, bundle Bundle, options DownloadOptions) ([]TrackGroup, error) {
+	args := []string{
+		"--gui",
+		"--non-interactive",
+		"--config", bundle.ConfigPath,
+		"--mp4box", bundle.MP4BoxPath,
+		"--list-tracks",
+	}
+	if options.Link.Kind == "artist" {
+		args = append(args, "--all-album")
+	}
+	args = append(args, options.Link.URL)
+
+	command := hiddenCommand(ctx, bundle.DownloaderExe, args...)
+	command.Dir = bundle.DownloaderDir
+	var stdout, stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	runErr := command.Run()
+
+	var lines []string
+	scanLines(&stdout, func(line string) { lines = append(lines, line) })
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(strings.TrimPrefix(lines[i], "\ufeff"))
+		if !strings.HasPrefix(line, "[") {
+			continue
+		}
+		var groups []TrackGroup
+		if err := json.Unmarshal([]byte(line), &groups); err == nil {
+			return groups, nil
+		}
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	message := strings.TrimSpace(stderr.String())
+	if message == "" && len(lines) > 0 {
+		message = strings.TrimSpace(lines[len(lines)-1])
+	}
+	if message == "" {
+		message = "无法获取歌曲列表"
+	}
+	return nil, &OperationError{Code: "list_tracks_failed", Message: message, ExitCode: exitCode(runErr)}
 }
 
 func RunDownload(ctx context.Context, bundle Bundle, options DownloadOptions) error {
@@ -91,6 +221,12 @@ func RunDownload(ctx context.Context, bundle Bundle, options DownloadOptions) er
 	}
 	if options.Quality == QualityAtmos {
 		args = append(args, "--atmos")
+	}
+	if options.SongFileFormat != "" {
+		args = append(args, "--song-file-format", options.SongFileFormat)
+	}
+	if options.SelectIndexes != "" {
+		args = append(args, "--select-indexes", options.SelectIndexes)
 	}
 	if options.Link.SingleSong {
 		args = append(args, "--song")

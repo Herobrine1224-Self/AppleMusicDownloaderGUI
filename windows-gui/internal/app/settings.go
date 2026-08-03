@@ -11,11 +11,14 @@ import (
 const (
 	QualityLossless = "lossless"
 	QualityAtmos    = "atmos"
+
+	SongFileFormatTitle = "{SongName}"
 )
 
 type Settings struct {
-	OutputDir string `json:"output_dir"`
-	Quality   string `json:"quality"`
+	OutputDir      string `json:"output_dir"`
+	Quality        string `json:"quality"`
+	SongFileFormat string `json:"song_file_format"`
 }
 
 type HistoryEntry struct {
@@ -42,8 +45,9 @@ func DefaultStore() (Store, error) {
 func DefaultSettings() Settings {
 	home, _ := os.UserHomeDir()
 	return Settings{
-		OutputDir: filepath.Join(home, "Music", "Apple Music Downloads"),
-		Quality:   QualityLossless,
+		OutputDir:      filepath.Join(home, "Music", "Apple Music Downloads"),
+		Quality:        QualityLossless,
+		SongFileFormat: SongFileFormatTitle,
 	}
 }
 
@@ -64,6 +68,9 @@ func (s Store) LoadSettings() (Settings, error) {
 	}
 	if settings.Quality != QualityLossless && settings.Quality != QualityAtmos {
 		settings.Quality = QualityLossless
+	}
+	if settings.SongFileFormat == "" {
+		settings.SongFileFormat = SongFileFormatTitle
 	}
 	return settings, nil
 }

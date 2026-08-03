@@ -13,7 +13,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -22,6 +24,8 @@ import (
 )
 
 const appTitle = "Apple Music 下载器"
+
+const runtimeShutdownTimeout = 30 * time.Second
 
 const (
 	pageChecking = iota
@@ -66,11 +70,12 @@ type gui struct {
 	deployButton *walk.PushButton
 	deployNote   *walk.Label
 
-	loginAppleID  *walk.LineEdit
-	loginPassword *walk.LineEdit
-	loginError    *walk.Label
-	loginButton   *walk.PushButton
-	loginProgress *walk.ProgressBar
+	loginAppleID      *walk.LineEdit
+	loginPassword     *walk.LineEdit
+	loginError        *walk.Label
+	loginButton       *walk.PushButton
+	loginProgress     *walk.ProgressBar
+	loginRemoveButton *walk.PushButton
 
 	codeEdit     *walk.LineEdit
 	codeError    *walk.Label
@@ -84,7 +89,9 @@ type gui struct {
 
 	linkEdit            *walk.LineEdit
 	qualityCombo        *walk.ComboBox
+	songFileFormatCombo *walk.ComboBox
 	outputEdit          *walk.LineEdit
+	fetchListButton     *walk.PushButton
 	downloadButton      *walk.PushButton
 	cancelButton        *walk.PushButton
 	downloadRetryButton *walk.PushButton
@@ -93,7 +100,18 @@ type gui struct {
 	taskDetail          *walk.Label
 	taskStats           *walk.Label
 	taskProgress        *walk.ProgressBar
-	taskLog             *walk.TextEdit
+
+	trackTable     *walk.TableView
+	trackModel     *trackTableModel
+	trackChecker   *trackChecker
+	trackSummary   *walk.Label
+	trackSelectAll *walk.PushButton
+	trackClearAll  *walk.PushButton
+	openLogButton  *walk.PushButton
+	logPath        string
+	logFile        *os.File
+	logMu          sync.Mutex
+	loadedLink     string
 
 	historyTable        *walk.TableView
 	historyOpenButton   *walk.PushButton
@@ -107,21 +125,64 @@ type gui struct {
 	stopButton   *walk.PushButton
 	removeButton *walk.PushButton
 
-	lastStatus      app.BootstrapStatus
-	busy            bool
-	opKind          string
-	cancel          context.CancelFunc
-	loginPending    bool
-	retryRequest    *downloadRequest
-	retryAfterLogin bool
-	progressStats   downloadProgressStats
-	closed          atomic.Bool
+	lastStatus        app.BootstrapStatus
+	busy              bool
+	opKind            string
+	cancel            context.CancelFunc
+	loginPending      bool
+	retryRequest      *downloadRequest
+	retryAfterLogin   bool
+	progressStats     downloadProgressStats
+	closed            atomic.Bool
+	shutdownRequested bool
+	shutdownPending   bool
+	closeAllowed      bool
+	runtimeStopped    bool
 }
 
 type downloadRequest struct {
-	link      app.LinkInfo
-	outputDir string
-	quality   string
+	link           app.LinkInfo
+	outputDir      string
+	quality        string
+	songFileFormat string
+	selectIndexes  string
+}
+
+type songFileFormatOption struct {
+	Label    string
+	Template string
+}
+
+var songFileFormats = []songFileFormatOption{
+	{"标题", "{SongName}"},
+	{"艺术家 - 标题", "{ArtistName} - {SongName}"},
+	{"标题 (音轨艺术家)", "{SongName} ({ArtistName})"},
+	{"音轨号. 标题", "{TrackNumber}. {SongName}"},
+	{"音轨号. 艺术家 - 标题", "{TrackNumber}. {ArtistName} - {SongName}"},
+	{"音轨号. 标题 (音轨艺术家)", "{TrackNumber}. {SongName} ({ArtistName})"},
+	{"碟片号.音轨号.标题", "{DiscNumber}.{TrackNumber}.{SongName}"},
+	{"碟片号.音轨号.艺术家 - 标题", "{DiscNumber}.{TrackNumber}.{ArtistName} - {SongName}"},
+	{"碟片号.音轨号.标题 (音轨艺术家)", "{DiscNumber}.{TrackNumber}.{SongName} ({ArtistName})"},
+	{"碟片号/音轨号. 标题", "{DiscNumber}/{TrackNumber}. {SongName}"},
+	{"碟片号/音轨号. 艺术家 - 标题", "{DiscNumber}/{TrackNumber}. {ArtistName} - {SongName}"},
+	{"碟片号/音轨号. 标题 (音轨艺术家)", "{DiscNumber}/{TrackNumber}. {SongName} ({ArtistName})"},
+}
+
+func songFileFormatLabels() []string {
+	labels := make([]string, len(songFileFormats))
+	for i, option := range songFileFormats {
+		labels[i] = option.Label
+	}
+	return labels
+}
+
+func songFileFormatIndex(template string) int {
+	for i, option := range songFileFormats {
+		if option.Template == template {
+			return i
+		}
+	}
+	return 0
 }
 
 func main() {
@@ -129,8 +190,8 @@ func main() {
 		if recovered := recover(); recovered != nil {
 			startupErr := fmt.Errorf("unexpected GUI panic: %v", recovered)
 			fmt.Fprintln(os.Stderr, startupErr)
-			if store, err := app.DefaultStore(); err == nil {
-				writeStartupError(store, startupErr)
+			if dir := startupLogsDir(); dir != "" {
+				writeStartupError(dir, startupErr)
 			}
 			walk.MsgBox(nil, appTitle, "程序启动失败，诊断信息已写入 gui-startup.log。", walk.MsgBoxOK|walk.MsgBoxIconError)
 		}
@@ -138,6 +199,16 @@ func main() {
 	runtime.LockOSThread()
 	walk.App().SetOrganizationName("AppleMusicDownloader")
 	walk.App().SetProductName("AppleMusicDownloader")
+	releaseInstance, acquired, instanceErr := app.AcquireSingleInstance()
+	if instanceErr != nil {
+		walk.MsgBox(nil, appTitle, "无法创建程序实例锁："+instanceErr.Error(), walk.MsgBoxOK|walk.MsgBoxIconError)
+		return
+	}
+	if !acquired {
+		walk.MsgBox(nil, appTitle, "程序已在运行。", walk.MsgBoxOK|walk.MsgBoxIconInformation)
+		return
+	}
+	defer releaseInstance()
 
 	bundle, bundleErr := app.DiscoverBundle()
 	store, storeErr := app.DefaultStore()
@@ -153,12 +224,16 @@ func main() {
 	g := &gui{
 		bundle: bundle, bundleErr: bundleErr, store: store,
 		settings: settings, history: history, model: &historyModel{},
-		pages: make([]*walk.Composite, 7),
+		trackModel:   newTrackTableModel(),
+		trackChecker: newTrackChecker(),
+		pages:        make([]*walk.Composite, 7),
 	}
+	g.trackModel.checker = g.trackChecker
 	g.model.Set(history)
+	defer g.stopManagedRuntimeAfterWindow()
 	if err := g.build(); err != nil {
 		fmt.Fprintln(os.Stderr, "GUI startup failed:", err)
-		writeStartupError(store, err)
+		writeStartupError(g.logsDir(), err)
 		walk.MsgBox(nil, appTitle, err.Error(), walk.MsgBoxOK|walk.MsgBoxIconError)
 		return
 	}
@@ -170,15 +245,54 @@ func main() {
 	g.mw.Run()
 }
 
-func writeStartupError(store app.Store, startupErr error) {
-	if store.Dir == "" || startupErr == nil {
+// programRoot returns the directory containing the program, honoring the
+// APPLEMUSIC_BUNDLE_ROOT override used by tests and development.
+func programRoot() string {
+	root := os.Getenv("APPLEMUSIC_BUNDLE_ROOT")
+	if root == "" {
+		executable, err := os.Executable()
+		if err != nil {
+			return ""
+		}
+		root = filepath.Dir(executable)
+	}
+	return root
+}
+
+// startupLogsDir returns the logs directory next to the program, used when the
+// GUI fails before the bundle is fully discovered.
+func startupLogsDir() string {
+	if root := programRoot(); root != "" {
+		return filepath.Join(root, "logs")
+	}
+	return ""
+}
+
+func writeStartupError(logDir string, startupErr error) {
+	if logDir == "" || startupErr == nil {
 		return
 	}
-	if err := os.MkdirAll(store.Dir, 0700); err != nil {
+	if err := os.MkdirAll(logDir, 0700); err != nil {
 		return
 	}
 	message := time.Now().Format(time.RFC3339) + " GUI startup failed: " + startupErr.Error() + "\r\n"
-	_ = os.WriteFile(filepath.Join(store.Dir, "gui-startup.log"), []byte(message), 0600)
+	message += string(debug.Stack()) + "\r\n"
+	_ = os.WriteFile(filepath.Join(logDir, "gui-startup.log"), []byte(message), 0600)
+}
+
+func writeShutdownError(logDir string, shutdownErr error) {
+	if logDir == "" || shutdownErr == nil {
+		return
+	}
+	if err := os.MkdirAll(logDir, 0700); err != nil {
+		return
+	}
+	file, err := os.OpenFile(filepath.Join(logDir, "gui-shutdown.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+	_, _ = fmt.Fprintf(file, "%s failed to stop the managed WSL runtime: %v\r\n", time.Now().Format(time.RFC3339), shutdownErr)
 }
 
 func (g *gui) build() error {
@@ -186,9 +300,18 @@ func (g *gui) build() error {
 	if g.settings.Quality == app.QualityAtmos {
 		qualityIndex = 1
 	}
+	fileFormatIndex := songFileFormatIndex(g.settings.SongFileFormat)
+
+	var appIcon *walk.Icon
+	if g.bundle.Root != "" {
+		if loaded, err := walk.NewIconFromFile(filepath.Join(g.bundle.Root, "app.ico")); err == nil {
+			appIcon = loaded
+		}
+	}
 
 	window := MainWindow{
 		AssignTo:   &g.mw,
+		Icon:       appIcon,
 		Title:      appTitle,
 		Size:       Size{Width: 1000, Height: 650},
 		MinSize:    Size{Width: 900, Height: 650},
@@ -221,7 +344,7 @@ func (g *gui) build() error {
 					g.loginPage(),
 					g.twoFactorPage(),
 					g.errorPage(),
-					g.readyTabs(qualityIndex),
+					g.readyTabs(qualityIndex, fileFormatIndex),
 				},
 			},
 		},
@@ -229,6 +352,7 @@ func (g *gui) build() error {
 	if err := window.Create(); err != nil {
 		return err
 	}
+	installTrackLVHooks(g)
 	g.updateHistoryActions()
 	return nil
 }
@@ -255,7 +379,17 @@ func (g *gui) start() {
 			g.taskStats.SetText("当前文件大小：42.8 MiB · 下载速度：6.4 MiB/s")
 			_ = g.taskProgress.SetMarqueeMode(false)
 			g.taskProgress.SetValue(42)
-			g.taskLog.SetText("正在下载媒体数据\r\n")
+			g.trackModel.Set([]app.TrackGroup{{
+				URL: "https://music.apple.com/cn/album/example/1", Title: "示例专辑", Artist: "示例艺人",
+				Tracks: []app.TrackItem{
+					{Index: 1, Name: "示例曲目 1", Artist: "示例艺人", Album: "示例专辑"},
+					{Index: 2, Name: "示例曲目 2", Artist: "示例艺人", Album: "示例专辑"},
+				},
+			}})
+			g.trackChecker.Reset(2)
+			g.updateTrackSummary()
+			g.trackSelectAll.SetEnabled(true)
+			g.trackClearAll.SetEnabled(true)
 			g.downloadButton.SetEnabled(false)
 			g.cancelButton.SetVisible(true)
 		}
@@ -272,11 +406,19 @@ func (g *gui) checkingPage() Widget {
 		Children: []Widget{
 			VSpacer{},
 			Label{AssignTo: &g.checkingTitle, Text: "正在检查运行环境", TextColor: colorText, Font: Font{Family: "Segoe UI", PointSize: 18, Bold: true}, MinSize: Size{Height: 32}},
-			Label{AssignTo: &g.checkingDetail, Text: "请稍候", TextColor: colorMuted, MinSize: Size{Height: 24}},
+			Label{AssignTo: &g.checkingDetail, Text: "请稍候", Visible: false, TextColor: colorMuted, MinSize: Size{Height: 24}},
 			ProgressBar{AssignTo: &g.checkingBar, MarqueeMode: true, MinSize: Size{Height: 8}, MaxSize: Size{Height: 8}},
 			VSpacer{},
 		},
 	}
+}
+
+func (g *gui) setCheckingDetail(text string) {
+	if g.checkingDetail == nil {
+		return
+	}
+	g.checkingDetail.SetText(text)
+	g.checkingDetail.SetVisible(text != "")
 }
 
 func (g *gui) deployPage() Widget {
@@ -289,7 +431,7 @@ func (g *gui) deployPage() Widget {
 			VSpacer{Size: 8},
 			Label{Text: "仅创建 AppleMusic-Runtime 专用发行版", TextColor: colorText, MinSize: Size{Height: 23}},
 			Label{Text: "不会修改或删除现有的 Ubuntu、Debian 等发行版", TextColor: colorText, MinSize: Size{Height: 23}},
-			Label{Text: "Windows 组件缺失时会显示一次管理员授权窗口", TextColor: colorText, MinSize: Size{Height: 23}},
+			Label{Text: "需要 Windows 已安装 WSL2（程序不会自动安装 WSL）", TextColor: colorText, MinSize: Size{Height: 23}},
 			VSpacer{Size: 12},
 			Composite{Layout: HBox{MarginsZero: true}, Children: []Widget{
 				PushButton{AssignTo: &g.deployButton, Text: "一键部署", MinSize: Size{Width: 132, Height: 38}, OnClicked: g.startInstall},
@@ -307,7 +449,7 @@ func (g *gui) deployingPage() Widget {
 		Children: []Widget{
 			VSpacer{},
 			Label{Text: "正在部署运行环境", TextColor: colorText, Font: Font{Family: "Segoe UI", PointSize: 18, Bold: true}, MinSize: Size{Height: 32}},
-			Label{Text: "下载并校验 Ubuntu Base，然后导入专用 WSL2 发行版。", TextColor: colorMuted, MinSize: Size{Height: 24}},
+			Label{Text: "下载并校验 Ubuntu WSL 镜像，然后导入专用 WSL2 发行版。", TextColor: colorMuted, MinSize: Size{Height: 24}},
 			ProgressBar{MarqueeMode: true, MinSize: Size{Height: 8}, MaxSize: Size{Height: 8}},
 			Label{Text: "期间请保持网络连接，不要关闭程序。", TextColor: colorMuted, MinSize: Size{Height: 23}},
 			VSpacer{},
@@ -349,6 +491,10 @@ func (g *gui) loginPage() Widget {
 				HSpacer{},
 			}},
 			Label{Text: "登录凭据只通过标准输入传给专用环境，不写入 Windows 配置或日志。", TextColor: colorMuted, MinSize: Size{Height: 23}},
+			Composite{Layout: HBox{MarginsZero: true}, Children: []Widget{
+				PushButton{AssignTo: &g.loginRemoveButton, Text: "备份并移除环境...", MinSize: Size{Width: 152, Height: 34}, OnClicked: g.removeRuntime},
+				HSpacer{},
+			}},
 			VSpacer{},
 		},
 	}
@@ -396,21 +542,21 @@ func (g *gui) errorPage() Widget {
 	}
 }
 
-func (g *gui) readyTabs(qualityIndex int) Widget {
+func (g *gui) readyTabs(qualityIndex, fileFormatIndex int) Widget {
 	return TabWidget{
 		AssignTo: &g.mainTabs, Visible: false,
 		ContentMargins: Margins{Left: 20, Top: 18, Right: 20, Bottom: 18},
 		Pages: []TabPage{
-			{Title: "下载", Layout: VBox{Margins: Margins{Left: 20, Top: 18, Right: 20, Bottom: 18}, Spacing: 10}, Children: g.downloadTab(qualityIndex)},
+			{Title: "下载", Layout: VBox{Margins: Margins{Left: 20, Top: 18, Right: 20, Bottom: 18}, Spacing: 10}, Children: g.downloadTab(qualityIndex, fileFormatIndex)},
 			{Title: "下载记录", Layout: VBox{Margins: Margins{Left: 20, Top: 18, Right: 20, Bottom: 18}, Spacing: 10}, Children: g.historyTab()},
 			{Title: "运行环境", Layout: VBox{Margins: Margins{Left: 20, Top: 18, Right: 20, Bottom: 18}, Spacing: 12}, Children: g.environmentTab()},
 		},
 	}
 }
 
-func (g *gui) downloadTab(qualityIndex int) []Widget {
+func (g *gui) downloadTab(qualityIndex, fileFormatIndex int) []Widget {
 	return []Widget{
-		LineEdit{AssignTo: &g.linkEdit, CueBanner: "https://music.apple.com/...", MinSize: Size{Height: 36}},
+		LineEdit{AssignTo: &g.linkEdit, CueBanner: "https://music.apple.com/...", Font: Font{Family: "Segoe UI", PointSize: 12}, MinSize: Size{Height: 30}},
 		Composite{Layout: HBox{MarginsZero: true, Spacing: 10}, Children: []Widget{
 			Label{Text: "音质", TextColor: colorText, MinSize: Size{Width: 36}},
 			ComboBox{AssignTo: &g.qualityCombo, Model: []string{"无损 ALAC", "杜比全景声"}, CurrentIndex: qualityIndex, MinSize: Size{Width: 120, Height: 34}, MaxSize: Size{Width: 140}},
@@ -419,11 +565,18 @@ func (g *gui) downloadTab(qualityIndex int) []Widget {
 			PushButton{Text: "选择...", MinSize: Size{Width: 86, Height: 34}, OnClicked: g.chooseOutputDir},
 			HSpacer{},
 		}},
+		Composite{Layout: HBox{MarginsZero: true, Spacing: 10}, Children: []Widget{
+			Label{Text: "文件名", TextColor: colorText, MinSize: Size{Width: 36}},
+			ComboBox{AssignTo: &g.songFileFormatCombo, Model: songFileFormatLabels(), CurrentIndex: fileFormatIndex, MinSize: Size{Width: 250, Height: 34}, MaxSize: Size{Width: 340}},
+			HSpacer{},
+		}},
 		Composite{Layout: HBox{MarginsZero: true}, Children: []Widget{
-			PushButton{AssignTo: &g.downloadButton, Text: "开始下载", MinSize: Size{Width: 122, Height: 36}, OnClicked: g.startDownload},
+			PushButton{AssignTo: &g.fetchListButton, Text: "获取列表", MinSize: Size{Width: 100, Height: 36}, OnClicked: g.fetchTrackList},
+			PushButton{AssignTo: &g.downloadButton, Text: "开始下载", Enabled: false, MinSize: Size{Width: 122, Height: 36}, OnClicked: g.startDownload},
 			PushButton{AssignTo: &g.cancelButton, Text: "取消", Visible: false, MinSize: Size{Width: 88, Height: 36}, OnClicked: g.cancelCurrentDownload},
 			PushButton{AssignTo: &g.downloadRetryButton, Text: "重试下载", Visible: false, MinSize: Size{Width: 100, Height: 36}, OnClicked: g.retryFailedDownload},
 			PushButton{Text: "打开下载目录", MinSize: Size{Width: 122, Height: 36}, OnClicked: g.openOutputDir},
+			PushButton{AssignTo: &g.openLogButton, Text: "打开日志", Enabled: false, MinSize: Size{Width: 96, Height: 36}, OnClicked: g.openTaskLog},
 			HSpacer{},
 		}},
 		Composite{AssignTo: &g.taskPanel, Visible: false, Layout: VBox{MarginsZero: true, Spacing: 8}, Children: []Widget{
@@ -432,8 +585,25 @@ func (g *gui) downloadTab(qualityIndex int) []Widget {
 			Label{AssignTo: &g.taskStats, Text: "当前文件大小：-- · 下载速度：--", TextColor: colorMuted, MinSize: Size{Height: 23}},
 			ProgressBar{AssignTo: &g.taskProgress, MarqueeMode: true, MinValue: 0, MaxValue: 100, MinSize: Size{Height: 8}, MaxSize: Size{Height: 8}},
 		}},
-		Label{Text: "任务日志", TextColor: colorText, Font: Font{Family: "Segoe UI", PointSize: 10, Bold: true}, MinSize: Size{Height: 23}},
-		TextEdit{AssignTo: &g.taskLog, ReadOnly: true, VScroll: true, TextColor: colorText, MinSize: Size{Height: 48}, StretchFactor: 1},
+		Composite{Layout: HBox{MarginsZero: true, Spacing: 10}, Children: []Widget{
+			Label{Text: "歌曲列表", TextColor: colorText, Font: Font{Family: "Segoe UI", PointSize: 10, Bold: true}, MinSize: Size{Height: 23}},
+			Label{AssignTo: &g.trackSummary, Text: "输入链接后点击“获取列表”获取歌曲列表", TextColor: colorMuted, MinSize: Size{Height: 23}},
+			HSpacer{},
+			PushButton{AssignTo: &g.trackSelectAll, Text: "全选", Enabled: false, MinSize: Size{Width: 72, Height: 30}, OnClicked: g.selectAllTracks},
+			PushButton{AssignTo: &g.trackClearAll, Text: "全不选", Enabled: false, MinSize: Size{Width: 80, Height: 30}, OnClicked: g.clearAllTracks},
+		}},
+		TableView{
+			AssignTo: &g.trackTable, Model: g.trackModel, AlternatingRowBG: true,
+			LastColumnStretched: true, CustomRowHeight: 26,
+			MinSize: Size{Height: 48}, StretchFactor: 1,
+			Columns: []TableViewColumn{
+				{Title: "选择", DataMember: "Selected", Width: 48},
+				{Title: "#", DataMember: "No", Width: 44},
+				{Title: "标题", DataMember: "Title", Width: 236},
+				{Title: "艺术家", DataMember: "Artist", Width: 150},
+				{Title: "专辑", DataMember: "Album", Width: 176},
+			},
+		},
 	}
 }
 
@@ -547,6 +717,9 @@ func (g *gui) updateEnvironment(status app.BootstrapStatus) {
 	}
 	g.stopButton.SetEnabled(status.Installed && status.Running && !g.busy)
 	g.removeButton.SetEnabled(status.Installed && !g.busy)
+	if g.loginRemoveButton != nil {
+		g.loginRemoveButton.SetEnabled(status.Installed && !g.busy)
+	}
 }
 
 func valueOrDash(value string) string {
@@ -559,6 +732,9 @@ func valueOrDash(value string) string {
 func (g *gui) beginOperation(kind string, timeout time.Duration) context.Context {
 	g.busy = true
 	g.opKind = kind
+	if g.loginRemoveButton != nil {
+		g.loginRemoveButton.SetEnabled(false)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	g.cancel = cancel
 	return ctx
@@ -571,6 +747,12 @@ func (g *gui) endOperation() {
 	g.cancel = nil
 	g.busy = false
 	g.opKind = ""
+	if g.loginRemoveButton != nil {
+		g.loginRemoveButton.SetEnabled(g.lastStatus.Installed)
+	}
+	if g.shutdownRequested && !g.shutdownPending && !g.closeAllowed && g.mw != nil {
+		go g.sync(g.stopRuntimeAndClose)
+	}
 }
 
 func (g *gui) sync(callback func()) {
@@ -590,7 +772,7 @@ func (g *gui) startInitialCheck() {
 	}
 	g.showOnboarding(pageChecking)
 	g.checkingTitle.SetText("正在检查运行环境")
-	g.checkingDetail.SetText("正在读取专用 WSL2 环境状态")
+	g.setCheckingDetail("正在读取专用 WSL2 环境状态")
 	_ = g.checkingBar.SetMarqueeMode(true)
 	g.headerStatus.SetText("检测中")
 	g.headerStatus.SetTextColor(walk.RGB(216, 218, 223))
@@ -606,16 +788,27 @@ func (g *gui) startInitialCheck() {
 		if err == nil && response.Status.Installed && !response.Status.Healthy {
 			g.sync(func() {
 				g.checkingTitle.SetText("正在启动运行环境")
-				g.checkingDetail.SetText("首次启动可能需要一些时间")
+				g.setCheckingDetail("")
 			})
 			response, err = client.Invoke(ctx, "start", nil)
 		}
 		g.sync(func() {
 			g.endOperation()
+			if g.shutdownRequested {
+				return
+			}
 			if err != nil {
 				if operationCode(err) == "login_required" {
 					g.lastStatus = response.Status
 					g.showLogin("")
+					return
+				}
+				if operationCode(err) == "wsl_platform_unavailable" {
+					// 只展示部署页并提示用户自行安装 WSL；程序不再自动安装。
+					g.deployNote.SetText("未检测到 Windows Subsystem for Linux (WSL)。请自行安装 WSL2：以管理员身份运行 wsl --install 并重启电脑，然后回到本程序点击“一键部署”。")
+					g.showOnboarding(pageDeploy)
+					g.headerStatus.SetText("尚未部署")
+					g.statusBar.SetText("等待部署专用运行环境")
 					return
 				}
 				g.showError("运行环境检查失败", err, g.startInitialCheck)
@@ -649,6 +842,9 @@ func (g *gui) startInstall() {
 		response, err := (app.BootstrapClient{Bundle: g.bundle}).Invoke(ctx, "install", nil)
 		g.sync(func() {
 			g.endOperation()
+			if g.shutdownRequested {
+				return
+			}
 			if err != nil {
 				if operationCode(err) == "reboot_required" {
 					g.showOnboarding(pageReboot)
@@ -670,6 +866,9 @@ func (g *gui) showLogin(message string) {
 	g.loginError.SetText(message)
 	g.loginButton.SetEnabled(true)
 	g.loginProgress.SetVisible(false)
+	if g.loginRemoveButton != nil {
+		g.loginRemoveButton.SetEnabled(g.lastStatus.Installed && !g.busy)
+	}
 	g.headerStatus.SetText("需要登录")
 	g.headerStatus.SetTextColor(walk.RGB(242, 184, 72))
 	g.statusBar.SetText("等待 Apple Music 登录")
@@ -707,6 +906,9 @@ func (g *gui) startLogin() {
 		}
 		g.sync(func() {
 			g.endOperation()
+			if g.shutdownRequested {
+				return
+			}
 			g.loginButton.SetEnabled(true)
 			g.loginProgress.SetVisible(false)
 			if err != nil {
@@ -776,6 +978,9 @@ func (g *gui) startTwoFactor() {
 		}
 		g.sync(func() {
 			g.endOperation()
+			if g.shutdownRequested {
+				return
+			}
 			g.codeButton.SetEnabled(true)
 			g.codeProgress.SetVisible(false)
 			if err != nil {
@@ -803,7 +1008,18 @@ func (g *gui) startTwoFactor() {
 func (g *gui) stopLoginRuntime() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	_, err := (app.BootstrapClient{Bundle: g.bundle}).Invoke(ctx, "stop", nil)
+	return stopManagedRuntime(ctx, app.BootstrapClient{Bundle: g.bundle})
+}
+
+type bootstrapInvoker interface {
+	Invoke(context.Context, string, []byte, ...string) (app.BootstrapResponse, error)
+}
+
+func stopManagedRuntime(ctx context.Context, client bootstrapInvoker) error {
+	_, err := client.Invoke(ctx, "stop", nil)
+	if operationCode(err) == "not_installed" {
+		return nil
+	}
 	return err
 }
 
@@ -858,7 +1074,184 @@ func (g *gui) startDownload() {
 	if g.qualityCombo.CurrentIndex() == 1 {
 		quality = app.QualityAtmos
 	}
-	g.startDownloadRequest(downloadRequest{link: link, outputDir: outputDir, quality: quality})
+	songFileFormat := app.SongFileFormatTitle
+	if index := g.songFileFormatCombo.CurrentIndex(); index >= 0 && index < len(songFileFormats) {
+		songFileFormat = songFileFormats[index].Template
+	}
+	if g.loadedLink != link.URL || g.trackModel.RowCount() == 0 {
+		walk.MsgBox(g.mw, "尚未获取歌曲列表", "请先点击“获取列表”加载歌曲列表。", walk.MsgBoxOK|walk.MsgBoxIconWarning)
+		return
+	}
+	indexes := g.trackChecker.SelectedIndexes()
+	if len(indexes) == 0 {
+		walk.MsgBox(g.mw, "未选择歌曲", "请先单击选择要下载的歌曲。", walk.MsgBoxOK|walk.MsgBoxIconWarning)
+		return
+	}
+	g.startDownloadRequest(downloadRequest{
+		link: link, outputDir: outputDir, quality: quality,
+		songFileFormat: songFileFormat, selectIndexes: joinTrackIndexes(indexes),
+	})
+}
+
+func (g *gui) fetchTrackList() {
+	if g.busy {
+		return
+	}
+	link, err := app.ValidateAppleMusicLink(g.linkEdit.Text())
+	if err != nil {
+		walk.MsgBox(g.mw, "链接无效", err.Error(), walk.MsgBoxOK|walk.MsgBoxIconWarning)
+		return
+	}
+	g.loadTrackList(link)
+}
+
+func joinTrackIndexes(indexes []int) string {
+	parts := make([]string, len(indexes))
+	for i, index := range indexes {
+		parts[i] = fmt.Sprintf("%d", index)
+	}
+	return strings.Join(parts, ",")
+}
+
+func (g *gui) loadTrackList(link app.LinkInfo) {
+	g.fetchListButton.SetEnabled(false)
+	g.downloadButton.SetEnabled(false)
+	g.trackSummary.SetText("正在获取歌曲列表...")
+	ctx := g.beginOperation("list-tracks", 10*time.Minute)
+	go func() {
+		client := app.BootstrapClient{Bundle: g.bundle}
+		statusResponse, err := client.Invoke(ctx, "start", nil)
+		if err == nil {
+			var groups []app.TrackGroup
+			groups, err = app.ListTracks(ctx, g.bundle, app.DownloadOptions{Link: link})
+			g.sync(func() { g.finishListTracks(link, groups, err, statusResponse.Status) })
+			return
+		}
+		g.sync(func() { g.finishListTracks(link, nil, err, statusResponse.Status) })
+	}()
+}
+
+func (g *gui) finishListTracks(link app.LinkInfo, groups []app.TrackGroup, err error, status app.BootstrapStatus) {
+	g.endOperation()
+	g.fetchListButton.SetEnabled(true)
+	g.lastStatus = status
+	if err != nil {
+		if operationCode(err) == "login_required" {
+			g.retryAfterLogin = true
+			g.showLogin("登录状态已失效，请重新登录后重试")
+			return
+		}
+		g.downloadButton.SetEnabled(false)
+		g.trackSummary.SetText("获取歌曲列表失败")
+		walk.MsgBox(g.mw, "无法获取歌曲列表", err.Error(), walk.MsgBoxOK|walk.MsgBoxIconError)
+		return
+	}
+	g.trackModel.Set(groups)
+	total := g.trackModel.RowCount()
+	g.trackChecker.Reset(total)
+	g.loadedLink = link.URL
+	g.trackSelectAll.SetEnabled(total > 0)
+	g.trackClearAll.SetEnabled(total > 0)
+	g.downloadButton.SetEnabled(total > 0)
+	g.updateTrackSummary()
+	g.statusBar.SetText(fmt.Sprintf("已加载 %d 首歌曲，单击选择后点击“开始下载”", total))
+	if total == 0 {
+		walk.MsgBox(g.mw, "没有歌曲", "该链接下没有可下载的歌曲。", walk.MsgBoxOK|walk.MsgBoxIconWarning)
+	}
+}
+
+func (g *gui) updateTrackSummary() {
+	total := g.trackModel.RowCount()
+	if total == 0 {
+		g.trackSummary.SetText("输入链接后点击“获取列表”获取歌曲列表")
+		return
+	}
+	g.trackSummary.SetText(fmt.Sprintf("共 %d 首，已选 %d 首", total, g.trackChecker.SelectedCount()))
+}
+
+func (g *gui) selectAllTracks() {
+	if g.trackModel.RowCount() == 0 {
+		return
+	}
+	g.trackChecker.SetAll(true)
+	g.trackModel.PublishRowsReset()
+	g.updateTrackSummary()
+}
+
+func (g *gui) clearAllTracks() {
+	if g.trackModel.RowCount() == 0 {
+		return
+	}
+	g.trackChecker.SetAll(false)
+	g.trackModel.PublishRowsReset()
+	g.updateTrackSummary()
+}
+
+func (g *gui) openTaskLog() {
+	if g.logPath == "" {
+		return
+	}
+	if _, err := os.Stat(g.logPath); err != nil {
+		walk.MsgBox(g.mw, "日志不存在", "日志文件已被移动或删除。", walk.MsgBoxOK|walk.MsgBoxIconWarning)
+		return
+	}
+	_ = exec.Command("explorer.exe", "/select,"+g.logPath).Start()
+}
+
+func (g *gui) writeLogFile(line string) {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return
+	}
+	g.logMu.Lock()
+	defer g.logMu.Unlock()
+	if g.logFile == nil {
+		return
+	}
+	_, _ = fmt.Fprintf(g.logFile, "%s %s\n", time.Now().Format("2006-01-02 15:04:05"), line)
+}
+
+func (g *gui) logsDir() string {
+	root := g.bundle.Root
+	if root == "" {
+		root = programRoot()
+	}
+	if root == "" {
+		return ""
+	}
+	return filepath.Join(root, "logs")
+}
+
+func (g *gui) openLogFile(taskID string) *os.File {
+	dir := g.logsDir()
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil
+	}
+	path := filepath.Join(dir, "download-"+taskID+".log")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		return nil
+	}
+	g.sync(func() {
+		g.logPath = path
+		g.openLogButton.SetEnabled(true)
+	})
+	return file
+}
+
+func (g *gui) closeLogFile() {
+	g.logMu.Lock()
+	defer g.logMu.Unlock()
+	if g.logFile != nil {
+		_ = g.logFile.Close()
+		g.logFile = nil
+	}
+}
+
+func (g *gui) setLogFile(file *os.File) {
+	g.logMu.Lock()
+	defer g.logMu.Unlock()
+	g.logFile = file
 }
 
 func (g *gui) startDownloadRequest(request downloadRequest) {
@@ -870,7 +1263,7 @@ func (g *gui) startDownloadRequest(request downloadRequest) {
 		walk.MsgBox(g.mw, "无法使用下载目录", err.Error(), walk.MsgBoxOK|walk.MsgBoxIconError)
 		return
 	}
-	g.settings = app.Settings{OutputDir: request.outputDir, Quality: request.quality}
+	g.settings = app.Settings{OutputDir: request.outputDir, Quality: request.quality, SongFileFormat: request.songFileFormat}
 	_ = g.store.SaveSettings(g.settings)
 	g.retryRequest = &request
 	g.retryAfterLogin = false
@@ -886,7 +1279,6 @@ func (g *gui) startDownloadRequest(request downloadRequest) {
 	g.progressStats.Reset()
 	g.updateTaskStats("")
 	_ = g.taskProgress.SetMarqueeMode(true)
-	g.taskLog.SetText("")
 	g.statusBar.SetText("下载任务正在运行")
 	ctx := g.beginOperation("download", 12*time.Hour)
 	go g.runDownload(ctx, request)
@@ -904,6 +1296,7 @@ func (g *gui) retryFailedDownload() {
 		qualityIndex = 1
 	}
 	_ = g.qualityCombo.SetCurrentIndex(qualityIndex)
+	_ = g.songFileFormatCombo.SetCurrentIndex(songFileFormatIndex(request.songFileFormat))
 	g.startDownloadRequest(request)
 }
 
@@ -915,10 +1308,18 @@ func (g *gui) runDownload(ctx context.Context, request downloadRequest) {
 		return
 	}
 
-	var tracks []app.DownloadedTrack
 	taskID := newTaskID()
+	logFile := g.openLogFile(taskID)
+	if logFile != nil {
+		g.setLogFile(logFile)
+		defer g.closeLogFile()
+		g.writeLogFile("下载任务开始：" + request.link.URL)
+	}
+
+	var tracks []app.DownloadedTrack
 	err = app.RunDownload(ctx, g.bundle, app.DownloadOptions{
-		Link: request.link, OutputDir: request.outputDir, Quality: request.quality, TaskID: taskID,
+		Link: request.link, OutputDir: request.outputDir, Quality: request.quality,
+		SongFileFormat: request.songFileFormat, SelectIndexes: request.selectIndexes, TaskID: taskID,
 		OnEvent: func(event app.DownloadEvent) {
 			if event.Event == "summary" && len(event.Tracks) > 0 {
 				tracks = append([]app.DownloadedTrack(nil), event.Tracks...)
@@ -926,7 +1327,7 @@ func (g *gui) runDownload(ctx context.Context, request downloadRequest) {
 			receivedAt := time.Now()
 			g.sync(func() { g.handleDownloadEvent(event, receivedAt) })
 		},
-		OnLog: func(line string) { g.sync(func() { g.appendTaskLog(line) }) },
+		OnLog: func(line string) { g.writeLogFile(line) },
 	})
 	g.finishDownload(request, tracks, err, statusResponse.Status)
 }
@@ -986,11 +1387,11 @@ func (g *gui) handleDownloadEvent(event app.DownloadEvent, receivedAt time.Time)
 		}
 	case "track_complete":
 		g.updateTaskStats("")
-		g.appendTaskLog("完成：" + event.Song)
+		g.writeLogFile("完成：" + event.Song)
 	case "warning":
-		g.appendTaskLog("警告：" + event.Message + formatDetail(event.Detail))
+		g.writeLogFile("警告：" + event.Message + formatDetail(event.Detail))
 	case "error":
-		g.appendTaskLog("错误：" + event.Message + formatDetail(event.Detail))
+		g.writeLogFile("错误：" + event.Message + formatDetail(event.Detail))
 	case "summary":
 		g.progressStats.Reset()
 		g.updateTaskStats("")
@@ -1028,20 +1429,8 @@ func formatDetail(detail string) string {
 	return "：" + detail
 }
 
-func (g *gui) appendTaskLog(line string) {
-	line = strings.TrimSpace(line)
-	if line == "" {
-		return
-	}
-	current := g.taskLog.Text()
-	if len(current) > 50000 {
-		current = current[len(current)-40000:]
-		g.taskLog.SetText(current)
-	}
-	g.taskLog.AppendText(line + "\r\n")
-}
-
 func (g *gui) finishDownload(request downloadRequest, tracks []app.DownloadedTrack, err error, status app.BootstrapStatus) {
+	defer g.closeLogFile()
 	g.sync(func() {
 		g.endOperation()
 		g.downloadButton.SetEnabled(true)
@@ -1073,7 +1462,7 @@ func (g *gui) finishDownload(request downloadRequest, tracks []app.DownloadedTra
 			message := downloadFailureMessage(err)
 			g.taskDetail.SetText(message)
 			g.updateTaskStats("")
-			g.appendTaskLog(message)
+			g.writeLogFile("下载失败：" + message)
 			g.statusBar.SetText("下载失败")
 			return
 		}
@@ -1255,6 +1644,9 @@ func (g *gui) stopRuntime() {
 		_, err := (app.BootstrapClient{Bundle: g.bundle}).Invoke(ctx, "stop", nil)
 		g.sync(func() {
 			g.endOperation()
+			if g.shutdownRequested {
+				return
+			}
 			if err != nil {
 				walk.MsgBox(g.mw, "停止失败", friendlyMessage(err), walk.MsgBoxOK|walk.MsgBoxIconError)
 				g.stopButton.SetEnabled(true)
@@ -1283,13 +1675,16 @@ func (g *gui) removeRuntime() {
 	}
 	g.showOnboarding(pageChecking)
 	g.checkingTitle.SetText("正在备份并移除运行环境")
-	g.checkingDetail.SetText("备份完成并通过校验前，不会注销专用发行版")
+	g.setCheckingDetail("备份完成并通过校验前，不会注销专用发行版")
 	g.statusBar.SetText("正在导出专用运行环境备份")
 	ctx := g.beginOperation("remove", 2*time.Hour)
 	go func() {
 		response, err := (app.BootstrapClient{Bundle: g.bundle}).Invoke(ctx, "remove", nil)
 		g.sync(func() {
 			g.endOperation()
+			if g.shutdownRequested {
+				return
+			}
 			if err != nil {
 				g.showError("移除运行环境失败", err, g.startInitialCheck)
 				return
@@ -1309,7 +1704,7 @@ func (g *gui) removeRuntime() {
 func (g *gui) openRuntimeLog() {
 	path := g.lastStatus.LogPath
 	if path == "" {
-		path = filepath.Join(g.store.Dir, "logs", "wrapper.log")
+		path = filepath.Join(g.logsDir(), "wrapper.log")
 	}
 	if _, err := os.Stat(path); err != nil {
 		walk.MsgBox(g.mw, "没有可用日志", "运行日志尚未生成。", walk.MsgBoxOK|walk.MsgBoxIconInformation)
@@ -1351,7 +1746,7 @@ func friendlyMessage(err error) string {
 		case "integrity_check_failed":
 			return "安装包完整性校验失败。请重新获取完整安装包，不要单独移动 payload 文件。\r\n\r\n" + operationErr.Message
 		case "wsl_platform_unavailable":
-			return "WSL2 系统组件无法启用。请检查 Windows 更新和虚拟化设置。\r\n\r\n" + operationErr.Message
+			return "未检测到 WSL2，程序不会自动安装。请先自行安装：以管理员身份打开 PowerShell 运行 wsl --install，重启电脑后再重试。\r\n\r\n" + operationErr.Message
 		case "ownership_check_failed", "distro_name_conflict":
 			return "专用发行版的所有权校验失败。程序不会操作来源不明的发行版。\r\n\r\n" + operationErr.Message
 		case "repair_required":
@@ -1379,45 +1774,98 @@ func (g *gui) restartWindows() {
 	}
 }
 
-func (g *gui) cleanupPendingLogin() {
-	g.statusBar.SetText("正在停止并清理登录会话")
-	ctx := g.beginOperation("login_cleanup", 30*time.Second)
+func (g *gui) stopRuntimeAndClose() {
+	if g.busy || g.shutdownPending || g.closeAllowed {
+		return
+	}
+	g.shutdownRequested = true
+	g.shutdownPending = true
+	g.statusBar.SetText("正在停止专用运行环境并退出")
+	ctx := g.beginOperation("shutdown", runtimeShutdownTimeout)
 	go func() {
-		_, err := (app.BootstrapClient{Bundle: g.bundle}).Invoke(ctx, "stop", nil)
+		err := stopManagedRuntime(ctx, app.BootstrapClient{Bundle: g.bundle})
 		g.sync(func() {
 			g.endOperation()
+			g.shutdownPending = false
+			exitOnError := false
 			if err != nil {
-				g.statusBar.SetText("登录会话清理失败，请重试")
-				walk.MsgBox(g.mw, "无法清理登录会话", friendlyMessage(err), walk.MsgBoxOK|walk.MsgBoxIconError)
+				writeShutdownError(g.logsDir(), err)
+				answer := walk.MsgBox(g.mw, "无法停止运行环境",
+					friendlyMessage(err)+"\r\n\r\n是否仍然退出？",
+					walk.MsgBoxYesNo|walk.MsgBoxIconWarning|walk.MsgBoxDefButton2)
+				exitOnError = answer == walk.DlgCmdYes
+			}
+			closeAllowed, runtimeStopped := shutdownOutcome(err, exitOnError)
+			if !closeAllowed {
+				g.shutdownRequested = false
+				g.statusBar.SetText("退出已取消，可稍后重试")
 				return
 			}
-			g.loginPending = false
-			g.lastStatus.Running = false
-			g.lastStatus.Healthy = false
-			g.statusBar.SetText("登录会话已清理，可以关闭程序")
+			if runtimeStopped {
+				g.loginPending = false
+				g.lastStatus.Running = false
+				g.lastStatus.Healthy = false
+				g.runtimeStopped = true
+				g.statusBar.SetText("专用运行环境已停止")
+			} else {
+				g.statusBar.SetText("正在退出，将再次尝试停止专用运行环境")
+			}
+			g.closeAllowed = true
+			g.mw.Close()
 		})
 	}()
 }
 
+func shutdownOutcome(stopErr error, exitOnError bool) (closeAllowed, runtimeStopped bool) {
+	if stopErr == nil {
+		return true, true
+	}
+	return exitOnError, false
+}
+
+func (g *gui) stopManagedRuntimeAfterWindow() {
+	g.closed.Store(true)
+	if g.cancel != nil {
+		g.cancel()
+	}
+	if g.runtimeStopped {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), runtimeShutdownTimeout)
+	defer cancel()
+	if err := stopManagedRuntime(ctx, app.BootstrapClient{Bundle: g.bundle}); err != nil {
+		fmt.Fprintln(os.Stderr, "failed to stop managed WSL runtime during GUI shutdown:", err)
+		writeShutdownError(g.logsDir(), err)
+	}
+}
+
 func (g *gui) onClosing(canceled *bool, reason walk.CloseReason) {
-	if !g.busy {
-		if g.loginPending {
-			*canceled = true
-			g.cleanupPendingLogin()
-			return
-		}
+	if g.closeAllowed {
 		g.closed.Store(true)
 		return
 	}
-	if g.opKind == "login_cleanup" {
-		*canceled = true
-		g.statusBar.SetText("正在清理登录会话，请稍候")
+	*canceled = true
+	if g.shutdownPending {
+		g.statusBar.SetText("正在停止专用运行环境并退出")
 		return
 	}
-	answer := walk.MsgBox(g.mw, "操作正在进行", "是否取消当前操作？清理完成后请再次关闭程序。", walk.MsgBoxYesNo|walk.MsgBoxIconWarning|walk.MsgBoxDefButton2)
-	*canceled = true
+	if g.shutdownRequested {
+		g.statusBar.SetText("正在取消当前操作并退出")
+		return
+	}
+	if !g.busy {
+		g.stopRuntimeAndClose()
+		return
+	}
+	if g.opKind == "shutdown" {
+		*canceled = true
+		g.statusBar.SetText("正在停止专用运行环境并退出")
+		return
+	}
+	answer := walk.MsgBox(g.mw, "操作正在进行", "是否取消当前操作并退出程序？", walk.MsgBoxYesNo|walk.MsgBoxIconWarning|walk.MsgBoxDefButton2)
 	if answer == walk.DlgCmdYes && g.cancel != nil {
-		g.statusBar.SetText("正在取消当前操作")
+		g.shutdownRequested = true
+		g.statusBar.SetText("正在取消当前操作并退出")
 		g.cancel()
 	}
 }

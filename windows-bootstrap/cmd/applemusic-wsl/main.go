@@ -3,14 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
-	"time"
 
 	"applemusic/wslbootstrap/bootstrap"
 )
@@ -38,15 +35,12 @@ func run(args []string) int {
 		printUsage()
 		return exitUsage
 	}
-	if args[0] == "platform-enable" {
-		return enablePlatform()
-	}
 
 	command := args[0]
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	payload := flags.String("payload", "", "directory containing wrapper and rootfs")
-	ubuntuBase := flags.String("ubuntu-base", "", "optional local Ubuntu Base tar.gz")
+	ubuntuBase := flags.String("ubuntu-base", "", "optional local Ubuntu WSL image (.wsl)")
 	jsonOutput := flags.Bool("json", false, "print machine-readable JSON")
 	backup := flags.String("backup", "", "backup tar path used by remove")
 	if err := flags.Parse(args[1:]); err != nil {
@@ -75,9 +69,6 @@ func run(args []string) int {
 	switch command {
 	case "install":
 		status, err := manager.Install(ctx)
-		if bootstrap.ErrorCodeOf(err) == bootstrap.CodePlatform {
-			return elevatePlatformAndResume(ctx, manager, *jsonOutput)
-		}
 		return printStatusResult(status, err, *jsonOutput)
 	case "status":
 		status, err := manager.Status(ctx)
@@ -143,50 +134,6 @@ func run(args []string) int {
 		printUsage()
 		return exitUsage
 	}
-}
-
-func elevatePlatformAndResume(ctx context.Context, manager *bootstrap.Manager, jsonOutput bool) int {
-	executable, err := os.Executable()
-	if err != nil {
-		printError(err, jsonOutput)
-		return exitFailure
-	}
-	executable, _ = filepath.Abs(executable)
-	exitCode, err := bootstrap.RunElevated(executable, []string{"platform-enable"})
-	if err != nil {
-		printError(bootstrap.Wrap(bootstrap.CodePlatform, "request administrator permission", err), jsonOutput)
-		return exitFailure
-	}
-	if exitCode == exitRebootRequired {
-		err := bootstrap.Wrap(bootstrap.CodeRebootRequired, "enable WSL", errors.New("Windows must restart before installation can continue; run install again after restart"))
-		printError(err, jsonOutput)
-		return exitRebootRequired
-	}
-	if exitCode != 0 {
-		err := bootstrap.Wrap(bootstrap.CodePlatform, "enable WSL", fmt.Errorf("elevated helper exited with code %d", exitCode))
-		printError(err, jsonOutput)
-		return exitForError(err)
-	}
-	status, err := manager.Install(ctx)
-	return printStatusResult(status, err, jsonOutput)
-}
-
-func enablePlatform() int {
-	if !bootstrap.IsElevated() {
-		fmt.Fprintln(os.Stderr, "platform-enable must run as administrator")
-		return exitFailure
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-	defer cancel()
-	reboot, err := bootstrap.EnableWSLFeatures(ctx, bootstrap.OSRunner{Timeout: 30 * time.Minute})
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return exitFailure
-	}
-	if reboot {
-		return exitRebootRequired
-	}
-	return 0
 }
 
 func printStatusResult(status bootstrap.Status, err error, jsonOutput bool) int {

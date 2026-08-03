@@ -35,25 +35,28 @@ import (
 )
 
 var (
-	forbiddenNames  = regexp.MustCompile(`[/\\<>:"|?*]`)
-	dl_atmos        bool
-	dl_select       bool
-	dl_song         bool
-	artist_select   bool
-	debug_mode      bool
-	print_json      bool
-	gui_mode        bool
-	non_interactive bool
-	config_path     string
-	output_root     string
-	mp4box_path     string
-	task_id         string
-	alac_max        *int
-	atmos_max       *int
-	Config          structs.ConfigSet
-	counter         structs.Counter
-	okDict          = make(map[string][]int)
-	AddedTracks     []AddedTrack
+	forbiddenNames   = regexp.MustCompile(`[/\\<>:"|?*]`)
+	dl_atmos         bool
+	dl_select        bool
+	dl_song          bool
+	artist_select    bool
+	debug_mode       bool
+	print_json       bool
+	gui_mode         bool
+	non_interactive  bool
+	config_path      string
+	output_root      string
+	mp4box_path      string
+	task_id          string
+	song_file_format string
+	list_tracks      bool
+	select_indexes   string
+	alac_max         *int
+	atmos_max        *int
+	Config           structs.ConfigSet
+	counter          structs.Counter
+	okDict           = make(map[string][]int)
+	AddedTracks      []AddedTrack
 )
 
 type AddedTrack struct {
@@ -120,6 +123,113 @@ func hasOption(args []string, name string) bool {
 		}
 	}
 	return false
+}
+
+type TrackItem struct {
+	Index       int    `json:"index"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Artist      string `json:"artist"`
+	Album       string `json:"album"`
+	TrackNumber int    `json:"track_number"`
+	DiscNumber  int    `json:"disc_number"`
+	DurationMs  int    `json:"duration_ms"`
+	Type        string `json:"type"`
+}
+
+type TrackGroup struct {
+	URL    string      `json:"url"`
+	Title  string      `json:"title"`
+	Artist string      `json:"artist"`
+	Tracks []TrackItem `json:"tracks"`
+}
+
+func parseIndexList(spec string) map[int]bool {
+	set := make(map[int]bool)
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if strings.Contains(part, "-") {
+			bounds := strings.SplitN(part, "-", 2)
+			lo, err1 := strconv.Atoi(strings.TrimSpace(bounds[0]))
+			hi, err2 := strconv.Atoi(strings.TrimSpace(bounds[1]))
+			if err1 == nil && err2 == nil && lo <= hi {
+				for i := lo; i <= hi; i++ {
+					set[i] = true
+				}
+			}
+			continue
+		}
+		if n, err := strconv.Atoi(part); err == nil {
+			set[n] = true
+		}
+	}
+	return set
+}
+
+func runListTracks(urls []string, token string) error {
+	globalIndex := 0
+	groups := []TrackGroup{}
+	for _, urlRaw := range urls {
+		if strings.Contains(urlRaw, "/song/") {
+			storefront, songId := checkUrlSong(urlRaw)
+			if storefront == "" || songId == "" {
+				continue
+			}
+			song, err := ampapi.GetSongResp(storefront, songId, Config.Language, token)
+			if err != nil {
+				return err
+			}
+			if len(song.Data) == 0 {
+				continue
+			}
+			attrs := song.Data[0].Attributes
+			globalIndex++
+			groups = append(groups, TrackGroup{
+				URL: urlRaw, Title: attrs.Name, Artist: attrs.ArtistName,
+				Tracks: []TrackItem{{
+					Index: globalIndex, ID: song.Data[0].ID, Name: attrs.Name,
+					Artist: attrs.ArtistName, Album: attrs.AlbumName,
+					TrackNumber: attrs.TrackNumber, DiscNumber: attrs.DiscNumber,
+					DurationMs: attrs.DurationInMillis, Type: song.Data[0].Type,
+				}},
+			})
+			continue
+		}
+		if strings.Contains(urlRaw, "/album/") {
+			storefront, albumId := checkUrl(urlRaw)
+			if storefront == "" || albumId == "" {
+				continue
+			}
+			album := task.NewAlbum(storefront, albumId)
+			if err := album.GetResp(token, Config.Language); err != nil {
+				return err
+			}
+			if len(album.Resp.Data) == 0 {
+				continue
+			}
+			meta := album.Resp.Data[0]
+			group := TrackGroup{URL: urlRaw, Title: meta.Attributes.Name, Artist: meta.Attributes.ArtistName}
+			for _, t := range meta.Relationships.Tracks.Data {
+				globalIndex++
+				group.Tracks = append(group.Tracks, TrackItem{
+					Index: globalIndex, ID: t.ID, Name: t.Attributes.Name,
+					Artist: t.Attributes.ArtistName, Album: t.Attributes.AlbumName,
+					TrackNumber: t.Attributes.TrackNumber, DiscNumber: t.Attributes.DiscNumber,
+					DurationMs: t.Attributes.DurationInMillis, Type: t.Type,
+				})
+			}
+			groups = append(groups, group)
+		}
+	}
+	out, err := json.Marshal(groups)
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(out))
+	return nil
 }
 
 func applyOutputRoot(root string) error {
@@ -900,6 +1010,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 		"{SongId}", track.ID,
 		"{SongNumer}", fmt.Sprintf("%02d", track.TaskNum),
 		"{SongName}", LimitString(track.Resp.Attributes.Name),
+		"{ArtistName}", LimitString(track.Resp.Attributes.ArtistName),
 		"{DiscNumber}", fmt.Sprintf("%0d", track.Resp.Attributes.DiscNumber),
 		"{TrackNumber}", fmt.Sprintf("%0d", track.Resp.Attributes.TrackNumber),
 		"{Quality}", Quality,
@@ -1016,7 +1127,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
 }
 
-func ripAlbum(albumId string, token string, storefront string, mediaUserToken string, urlArg_i string) error {
+func ripAlbum(albumId string, token string, storefront string, mediaUserToken string, urlArg_i string, globalIndex *int, selectSet map[int]bool) error {
 	album := task.NewAlbum(storefront, albumId)
 	err := album.GetResp(token, Config.Language)
 	if err != nil {
@@ -1204,6 +1315,15 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 		}
 		return nil
 	}
+	if selectSet != nil {
+		for i := range album.Tracks {
+			*globalIndex++
+			if selectSet[*globalIndex] {
+				ripTrack(&album.Tracks[i], token, mediaUserToken)
+			}
+		}
+		return nil
+	}
 	var selected []int
 	if !dl_select {
 		selected = arr
@@ -1320,6 +1440,9 @@ func run() int {
 	pflag.StringVar(&output_root, "output", "", "Root directory for downloaded media")
 	pflag.StringVar(&mp4box_path, "mp4box", mp4box_path, "Path to MP4Box executable")
 	pflag.StringVar(&task_id, "task-id", "", "Optional GUI task identifier used for isolated temporary files")
+	pflag.StringVar(&song_file_format, "song-file-format", "", "Override the song file name template from config.yaml")
+	pflag.BoolVar(&list_tracks, "list-tracks", false, "List tracks for the given URL(s) as JSON and exit")
+	pflag.StringVar(&select_indexes, "select-indexes", "", "Download only the given 1-based global track indexes (comma/range separated)")
 	alac_max = pflag.Int("alac-max", Config.AlacMax, "Specify the max quality for download alac")
 	atmos_max = pflag.Int("atmos-max", Config.AtmosMax, "Specify the max quality for download atmos")
 
@@ -1333,6 +1456,9 @@ func run() int {
 	pflag.Parse()
 	Config.AlacMax = *alac_max
 	Config.AtmosMax = *atmos_max
+	if song_file_format != "" {
+		Config.SongFileFormat = song_file_format
+	}
 	if gui_mode {
 		non_interactive = true
 		color.NoColor = true
@@ -1424,6 +1550,19 @@ func run() int {
 		}
 		urls = albumArgs
 	}
+	if list_tracks {
+		if err := runListTracks(urls, token); err != nil {
+			fmt.Printf("Failed to list tracks: %v\n", err)
+			emitGUIError("无法获取歌曲列表", err)
+			return 1
+		}
+		return 0
+	}
+	var selectSet map[int]bool
+	if select_indexes != "" {
+		selectSet = parseIndexList(select_indexes)
+	}
+	globalIndex := 0
 	albumTotal := len(urls)
 	for {
 		for albumNum, urlRaw := range urls {
@@ -1465,7 +1604,7 @@ func run() int {
 					counter.Error++
 					continue
 				}
-				err := ripAlbum(albumId, token, storefront, Config.MediaUserToken, urlArg_i)
+				err := ripAlbum(albumId, token, storefront, Config.MediaUserToken, urlArg_i, &globalIndex, selectSet)
 				if err != nil {
 					fmt.Println("Failed to rip album:", err)
 					emitGUIError("专辑下载失败", err)
@@ -1743,7 +1882,7 @@ func ripSong(songId string, token string, storefront string, mediaUserToken stri
 
 	// Use album approach but only download the specific song
 	dl_song = true
-	err = ripAlbum(albumId, token, storefront, mediaUserToken, songId)
+	err = ripAlbum(albumId, token, storefront, mediaUserToken, songId, nil, nil)
 	if err != nil {
 		fmt.Println("Failed to rip song:", err)
 		return err

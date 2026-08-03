@@ -28,6 +28,55 @@ func TestDownloadFailureMessageDistinguishesTimeout(t *testing.T) {
 	}
 }
 
+func TestStopManagedRuntimeUsesBootstrapStop(t *testing.T) {
+	client := &recordingBootstrapInvoker{}
+	if err := stopManagedRuntime(context.Background(), client); err != nil {
+		t.Fatal(err)
+	}
+	if client.operation != "stop" {
+		t.Fatalf("operation = %q, want stop", client.operation)
+	}
+	if client.stdin != nil {
+		t.Fatalf("stop stdin = %q, want nil", client.stdin)
+	}
+}
+
+func TestStopManagedRuntimeTreatsMissingRuntimeAsStopped(t *testing.T) {
+	client := &recordingBootstrapInvoker{err: &app.OperationError{Code: "not_installed", Message: "runtime is not installed"}}
+	if err := stopManagedRuntime(context.Background(), client); err != nil {
+		t.Fatalf("stopManagedRuntime() error = %v, want nil", err)
+	}
+
+	want := errors.New("stop failed")
+	client.err = want
+	if err := stopManagedRuntime(context.Background(), client); !errors.Is(err, want) {
+		t.Fatalf("stopManagedRuntime() error = %v, want %v", err, want)
+	}
+}
+
+func TestShutdownOutcome(t *testing.T) {
+	stopErr := errors.New("stop failed")
+	tests := []struct {
+		name               string
+		err                error
+		exitOnError        bool
+		wantCloseAllowed   bool
+		wantRuntimeStopped bool
+	}{
+		{name: "stopped", wantCloseAllowed: true, wantRuntimeStopped: true},
+		{name: "failure cancels exit", err: stopErr},
+		{name: "failure forces exit", err: stopErr, exitOnError: true, wantCloseAllowed: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			closeAllowed, runtimeStopped := shutdownOutcome(test.err, test.exitOnError)
+			if closeAllowed != test.wantCloseAllowed || runtimeStopped != test.wantRuntimeStopped {
+				t.Fatalf("shutdownOutcome() = (%t, %t), want (%t, %t)", closeAllowed, runtimeStopped, test.wantCloseAllowed, test.wantRuntimeStopped)
+			}
+		})
+	}
+}
+
 func TestHistoryWithoutIndex(t *testing.T) {
 	original := []app.HistoryEntry{{Song: "one"}, {Song: "two"}, {Song: "three"}}
 	tests := []struct {
@@ -88,4 +137,16 @@ func historySongs(entries []app.HistoryEntry) []string {
 		songs[i] = entry.Song
 	}
 	return songs
+}
+
+type recordingBootstrapInvoker struct {
+	operation string
+	stdin     []byte
+	err       error
+}
+
+func (c *recordingBootstrapInvoker) Invoke(_ context.Context, operation string, stdin []byte, _ ...string) (app.BootstrapResponse, error) {
+	c.operation = operation
+	c.stdin = stdin
+	return app.BootstrapResponse{}, c.err
 }

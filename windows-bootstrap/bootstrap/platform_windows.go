@@ -3,7 +3,6 @@
 package bootstrap
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -37,16 +36,17 @@ func defaultConfig(payloadDir, ubuntuBasePath string, requirePayload bool) (Conf
 		}
 	}
 	return Config{
-		AppDataDir:      filepath.Join(localAppData, "AppleMusicDownloader"),
-		PayloadDir:      payloadDir,
-		UbuntuBasePath:  ubuntuBasePath,
-		UbuntuBaseURL:   UbuntuBaseURL,
-		UbuntuBaseHash:  UbuntuBaseSHA256,
-		PayloadHash:     PayloadSHA256,
-		RuntimeVersion:  RuntimeVersion,
-		DownloadTimeout: 30 * 60 * 1e9,
-		CommandTimeout:  15 * 60 * 1e9,
-		StartupTimeout:  90 * 1e9,
+		AppDataDir:        filepath.Join(localAppData, "AppleMusicDownloader"),
+		PayloadDir:        payloadDir,
+		UbuntuBasePath:    ubuntuBasePath,
+		UbuntuBaseURL:     UbuntuBaseURL,
+		UbuntuBaseMirrors: UbuntuBaseMirrors,
+		UbuntuBaseHash:    UbuntuBaseSHA256,
+		PayloadHash:       PayloadSHA256,
+		RuntimeVersion:    RuntimeVersion,
+		DownloadTimeout:   30 * 60 * 1e9,
+		CommandTimeout:    15 * 60 * 1e9,
+		StartupTimeout:    90 * 1e9,
 	}, nil
 }
 
@@ -163,93 +163,103 @@ func SystemExecutable(name string) (string, error) {
 	return path, nil
 }
 
-func EnableWSLFeatures(ctx context.Context, runner Runner) (bool, error) {
-	if !IsElevated() {
-		return false, errors.New("platform helper must run elevated")
+// wslInstalledWithoutProbe reports whether the WSL optional component appears
+// to be installed, without executing wsl.exe. When the WSL components are
+// missing, the System32 wsl.exe launcher opens an interactive "install WSL"
+// console window that blocks for up to a minute, so management commands must
+// not invoke wsl.exe until a real installation is detected.
+//
+// The probe is deliberately conservative: it only returns true when a concrete
+// WSL installation artifact is found (MSI metadata, Store package registration,
+// WSL service, or WSL binaries). A false negative only makes the GUI show the
+// deploy page, and install still performs the authoritative wsl.exe probe.
+func wslInstalledWithoutProbe() bool {
+	// WSL 2.x MSI (wsl --update / 本地 MSI) 把二进制装到 %ProgramFiles%\WSL，
+	// 并在 Lxss\MSI 下登记安装元数据。
+	if programFiles := os.Getenv("ProgramFiles"); programFiles != "" {
+		if _, err := os.Stat(filepath.Join(programFiles, "WSL", "wsl.exe")); err == nil {
+			return true
+		}
 	}
-	root := os.Getenv("SystemRoot")
-	if root == "" {
-		return false, errors.New("SystemRoot is not set")
+	if windowsRegistryKeyExists(`SOFTWARE\Microsoft\Windows\CurrentVersion\Lxss\MSI`) {
+		return true
 	}
-	return enableWSLFeaturesAt(ctx, runner, root)
+	// 经典可选组件注册 LxssManager 服务，现代 Store/MSI 版本注册 WslService
+	// 服务；两者都通过 Windows 服务注册表登记，不必执行 wsl.exe。
+	for _, service := range []string{"WslService", "LxssManager"} {
+		if windowsRegistryKeyExists(`SYSTEM\CurrentControlSet\Services\` + service) {
+			return true
+		}
+	}
+	// Store/MSIX 安装会为所有用户登记 Windows Subsystem for Linux 包。
+	return appxAllUsersPackageRegistered("MicrosoftCorporationII.WindowsSubsystemForLinux")
 }
 
-func enableWSLFeaturesAt(ctx context.Context, runner Runner, systemRoot string) (bool, error) {
-	wslPath := filepath.Join(systemRoot, "System32", "wsl.exe")
-	installSucceeded := false
-	rebootRequired := false
-	installResult, installErr := runner.Run(ctx, Command{
-		Path: wslPath,
-		Args: []string{"--install", "--no-distribution", "--web-download"},
-	})
-	if installErr == nil {
-		switch installResult.ExitCode {
-		case 0:
-			installSucceeded = true
-		case 3010:
-			installSucceeded = true
-			rebootRequired = true
-		}
-	}
-	dism := filepath.Join(systemRoot, "System32", "dism.exe")
-	features := []string{"Microsoft-Windows-Subsystem-Linux", "VirtualMachinePlatform"}
-	for _, feature := range features {
-		result, err := runner.Run(ctx, Command{Path: dism, Args: []string{
-			"/Online", "/Enable-Feature", "/FeatureName:" + feature, "/All", "/NoRestart", "/English",
-		}})
-		if err != nil {
-			return rebootRequired, err
-		}
-		if result.ExitCode == 3010 {
-			rebootRequired = true
-			continue
-		}
-		if result.ExitCode != 0 {
-			return rebootRequired, commandFailure("enable Windows feature "+feature, result)
-		}
-		output := DecodeWindowsOutput(append(append([]byte{}, result.Stdout...), result.Stderr...))
-		if strings.Contains(strings.ToLower(output), "restart required : yes") {
-			rebootRequired = true
-		}
-	}
-	if rebootRequired {
-		return true, nil
-	}
-	if installSucceeded {
-		return false, nil
-	}
+const (
+	hkeyLocalMachine = uintptr(0x80000002)
+	keyQueryValue    = uint32(0x0001)
+	keyEnumSubKeys   = uint32(0x0008)
+	errorSuccess     = uintptr(0)
+)
 
-	// Older inbox WSL versions may not understand --no-distribution. Once the
-	// optional components are enabled, update the kernel/package without ever
-	// requesting a Store distribution installation.
-	var updateErrors []error
-	for _, args := range [][]string{{"--update", "--web-download"}, {"--update"}} {
-		result, runErr := runner.Run(ctx, Command{Path: wslPath, Args: args})
-		if runErr != nil {
-			updateErrors = append(updateErrors, runErr)
-			continue
+var (
+	advapi32          = syscall.NewLazyDLL("advapi32.dll")
+	procRegOpenKeyExW = advapi32.NewProc("RegOpenKeyExW")
+	procRegCloseKey   = advapi32.NewProc("RegCloseKey")
+	procRegEnumKeyExW = advapi32.NewProc("RegEnumKeyExW")
+)
+
+func windowsRegistryKeyExists(path string) bool {
+	handle, ok := openWindowsRegistryKey(hkeyLocalMachine, path)
+	if !ok {
+		return false
+	}
+	procRegCloseKey.Call(handle)
+	return true
+}
+
+func openWindowsRegistryKey(root uintptr, path string) (uintptr, bool) {
+	name, err := syscall.UTF16PtrFromString(path)
+	if err != nil {
+		return 0, false
+	}
+	var handle uintptr
+	status, _, _ := procRegOpenKeyExW.Call(
+		root,
+		uintptr(unsafe.Pointer(name)),
+		0,
+		uintptr(keyQueryValue|keyEnumSubKeys),
+		uintptr(unsafe.Pointer(&handle)),
+	)
+	if status != errorSuccess {
+		return 0, false
+	}
+	return handle, true
+}
+
+func appxAllUsersPackageRegistered(packagePrefix string) bool {
+	const path = `SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\Applications`
+	handle, ok := openWindowsRegistryKey(hkeyLocalMachine, path)
+	if !ok {
+		return false
+	}
+	defer procRegCloseKey.Call(handle)
+	prefix := strings.ToLower(packagePrefix)
+	for index := uint32(0); ; index++ {
+		buffer := make([]uint16, 512)
+		nameSize := uint32(len(buffer))
+		status, _, _ := procRegEnumKeyExW.Call(
+			handle,
+			uintptr(index),
+			uintptr(unsafe.Pointer(&buffer[0])),
+			uintptr(unsafe.Pointer(&nameSize)),
+			0, 0, 0, 0,
+		)
+		if status != errorSuccess {
+			return false
 		}
-		if result.ExitCode == 0 {
-			return false, nil
+		if strings.HasPrefix(strings.ToLower(syscall.UTF16ToString(buffer[:nameSize])), prefix) {
+			return true
 		}
-		if result.ExitCode == 3010 {
-			return true, nil
-		}
-		updateErrors = append(updateErrors, commandFailure("update WSL2 kernel", result))
 	}
-	status, statusErr := runner.Run(ctx, Command{Path: wslPath, Args: []string{"--status"}})
-	if statusErr == nil && status.ExitCode == 0 {
-		return false, nil
-	}
-	if installErr != nil {
-		updateErrors = append(updateErrors, installErr)
-	} else if installResult.ExitCode != 0 {
-		updateErrors = append(updateErrors, commandFailure("install WSL platform", installResult))
-	}
-	if statusErr != nil {
-		updateErrors = append(updateErrors, statusErr)
-	} else if status.ExitCode != 0 {
-		updateErrors = append(updateErrors, commandFailure("probe WSL platform after enable", status))
-	}
-	return false, errors.Join(updateErrors...)
 }

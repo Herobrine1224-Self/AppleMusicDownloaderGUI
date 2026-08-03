@@ -48,6 +48,26 @@ func (m *historyModel) Set(entries []app.HistoryEntry) {
 	m.PublishRowsReset()
 }
 
+func (m *historyModel) Value(row, col int) interface{} {
+	if row < 0 || row >= len(m.rows) {
+		return ""
+	}
+	item := m.rows[row]
+	switch col {
+	case 0:
+		return item.Title
+	case 1:
+		return item.Artist
+	case 2:
+		return item.Album
+	case 3:
+		return item.Completed
+	case 4:
+		return item.Path
+	}
+	return ""
+}
+
 func historyWithoutIndex(entries []app.HistoryEntry, index int) ([]app.HistoryEntry, bool) {
 	if index < 0 || index >= len(entries) {
 		return entries, false
