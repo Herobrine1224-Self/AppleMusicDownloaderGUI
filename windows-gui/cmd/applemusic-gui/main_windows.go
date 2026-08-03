@@ -1182,7 +1182,7 @@ func (g *gui) selectAllTracks() {
 		return
 	}
 	g.trackChecker.SetAll(true)
-	g.trackModel.PublishRowsReset()
+	g.trackModel.PublishRowsChanged(0, g.trackModel.RowCount()-1)
 	g.updateTrackSummary()
 }
 
@@ -1191,7 +1191,7 @@ func (g *gui) clearAllTracks() {
 		return
 	}
 	g.trackChecker.SetAll(false)
-	g.trackModel.PublishRowsReset()
+	g.trackModel.PublishRowsChanged(0, g.trackModel.RowCount()-1)
 	g.updateTrackSummary()
 }
 
